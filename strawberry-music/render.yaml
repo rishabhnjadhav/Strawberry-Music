@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: strawberry-music
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m server.main
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.4
+      - key: PYTHONUNBUFFERED
+        value: "1"
