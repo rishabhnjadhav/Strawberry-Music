@@ -224,17 +224,21 @@ def cookie_file() -> str | None:
 
 def disconnect() -> None:
     global _auth_path
-    for candidate in AUTH_CANDIDATES:
-        if candidate and os.path.exists(candidate):
+    paths = {candidate for candidate in AUTH_CANDIDATES if candidate}
+    current = auth_path()
+    if current:
+        paths.add(current)
+    for candidate in paths:
+        if os.path.exists(candidate):
             try:
                 os.remove(candidate)
             except OSError:
                 pass
-            cookie_path = os.path.join(os.path.dirname(candidate), "auth.cookies.txt")
-            try:
-                os.remove(cookie_path)
-            except OSError:
-                pass
+        cookie_path = os.path.join(os.path.dirname(candidate), "auth.cookies.txt")
+        try:
+            os.remove(cookie_path)
+        except OSError:
+            pass
     with _auth_lock:
         _auth_path = None
     reset_clients()
