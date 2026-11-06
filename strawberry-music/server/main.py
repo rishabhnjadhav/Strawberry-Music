@@ -261,13 +261,18 @@ def api_stream(video_id: str, request: Request):
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001
             log.warning("Stream %s failed: %s", video_id, exc)
-            raise HTTPException(
-                status_code=502,
-                detail=(
+            message = str(exc)
+            if "Sign in to confirm" in message or "not a bot" in message:
+                detail = (
+                    "YouTube is blocking anonymous playback from this server. "
+                    "Open Settings → YouTube Music, connect your account, then try again."
+                )
+            else:
+                detail = (
                     "Could not resolve audio for this track. The service may be busy. "
-                    f"Please try again in a moment. ({exc})"
-                ),
-            ) from exc
+                    "Please try again in a moment."
+                )
+            raise HTTPException(status_code=502, detail=detail) from exc
 
         try:
             upstream = requests.get(

@@ -93,7 +93,7 @@ You can also place a compatible `auth.json` session file in the project folder
 | `OMNI_COUNTRY` | `IN` | Catalog country/region code |
 | `OMNI_COOKIES` | – | Netscape cookies file for age/region-locked tracks |
 | `OMNI_PROXY` | – | HTTP/SOCKS proxy for the stream resolver |
-| `OMNI_STREAM_CLIENTS` | `android_vr` | Comma-separated resolver clients, e.g. `android_vr,android,ios` |
+| `OMNI_STREAM_CLIENTS` | `android` | Comma-separated resolver clients, e.g. `android,android_vr,ios` |
 
 Example:
 

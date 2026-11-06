@@ -10,6 +10,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import yt_dlp
 
+from . import ytm
+
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,20}$")
 STREAM_TTL = 3 * 60 * 60  # googlevideo URLs are valid for ~6h
 FAILURE_TTL = 60
@@ -36,6 +38,15 @@ MIME_TYPES = {
 }
 
 
+def clients() -> list[str]:
+    value = (
+        os.environ.get("OMNI_STREAM_CLIENTS")
+        or os.environ.get("OMNI_YTDLP_CLIENTS")
+        or "android"
+    )
+    return [client.strip() for client in value.split(",") if client.strip()]
+
+
 def _base_options() -> dict:
     options = {
         "format": "bestaudio[ext=m4a]/bestaudio/best",
@@ -57,17 +68,21 @@ def _base_options() -> dict:
     cookies = os.environ.get("OMNI_COOKIES")
     if cookies and os.path.exists(cookies):
         options["cookiefile"] = cookies
+    else:
+        try:
+            generated = ytm.cookie_file()
+        except Exception:  # noqa: BLE001 - never let cookie export break playback
+            generated = None
+        if generated:
+            options["cookiefile"] = generated
     proxy = os.environ.get("OMNI_PROXY")
     if proxy:
         options["proxy"] = proxy
-    clients = (
-        os.environ.get("OMNI_STREAM_CLIENTS")
-        or os.environ.get("OMNI_YTDLP_CLIENTS")
-        or "android_vr"
-    )
-    options["extractor_args"] = {
-        "youtube": {"player_client": [c.strip() for c in clients.split(",") if c.strip()]}
-    }
+    extractor_args = {"player_client": clients()}
+    visitor = ytm.visitor_data()
+    if visitor:
+        extractor_args["visitor_data"] = [visitor]
+    options["extractor_args"] = {"youtube": extractor_args}
     return options
 
 
@@ -216,4 +231,6 @@ def cache_info() -> dict:
         return {
             "resolved": len(_cache),
             "failed": len(_failures),
+            "clients": clients(),
+            "cookies": bool(os.environ.get("OMNI_COOKIES") or ytm.auth_path()),
         }

@@ -12,8 +12,11 @@ env/
 # Secrets and local auth
 auth.json
 server/auth.json
+auth.cookies.txt
+server/auth.cookies.txt
 cookies.txt
 server/cookies.txt
+*.cookies.txt
 .env
 .env.*
 !.env.example
