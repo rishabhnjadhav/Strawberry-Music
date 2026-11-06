@@ -20,6 +20,8 @@ const listeners = {
   empty: new Set(),
 };
 
+let needsAuth = false;
+
 const state = {
   queue: [],
   index: -1,
@@ -148,6 +150,11 @@ function load(autoplay) {
         state.playing = false;
         state.loading = false;
         emit("state");
+        if (needsAuth) {
+          emit("error", "Playback on this server needs YouTube Music sign-in. Open Settings → YouTube Music.");
+          stopAtEnd();
+          return;
+        }
         emit(
           "error",
           error.name === "NotAllowedError"
@@ -561,6 +568,11 @@ audio.addEventListener("error", () => {
   if (!audio.src || !state.queue.length) return;
   state.loading = false;
   setPlaying(false);
+  if (needsAuth) {
+    emit("error", "Playback on this server needs YouTube Music sign-in. Open Settings → YouTube Music.");
+    stopAtEnd();
+    return;
+  }
   emit("error", "Could not load audio for this track. Try again in a moment.");
   next(true);
 });
@@ -572,6 +584,9 @@ audio.addEventListener("error", () => {
 export const player = {
   state,
   current,
+  setNeedsAuth(value) {
+    needsAuth = Boolean(value);
+  },
   on(event, fn) {
     listeners[event]?.add(fn);
     return () => listeners[event]?.delete(fn);

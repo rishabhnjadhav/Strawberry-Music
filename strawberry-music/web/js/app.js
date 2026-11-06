@@ -84,6 +84,23 @@ function toast(message) {
   toast.timer = setTimeout(() => toastEl.classList.remove("show"), 2800);
 }
 
+function isLocalHost() {
+  return ["localhost", "127.0.0.1", "::1"].includes(location.hostname);
+}
+
+function applyHealth(health) {
+  state.health = health;
+  player.setNeedsAuth(!isLocalHost() && !health?.authenticated);
+}
+
+async function refreshHealth() {
+  try {
+    applyHealth(await api.health());
+  } catch {
+    /* health is optional; playback still works locally */
+  }
+}
+
 function cached(key, producer, ttl = CACHE_TTL) {
   const hit = state.cache.get(key);
   if (hit && Date.now() - hit.at < ttl) return Promise.resolve(hit.data);
@@ -1520,7 +1537,7 @@ async function openSettings() {
     }
     try {
       const data = await api.authConnect(headers);
-      state.health = { ...(state.health || {}), ...data };
+      applyHealth({ ...(state.health || {}), ...data });
       state.home = null;
       state.homeAt = 0;
       state.explore = null;
@@ -1543,7 +1560,7 @@ async function openSettings() {
   $("ytDisconnect").addEventListener("click", async () => {
     try {
       const data = await api.authDisconnect();
-      state.health = { ...(state.health || {}), ...data };
+      applyHealth({ ...(state.health || {}), ...data });
       state.home = null;
       state.homeAt = 0;
       state.explore = null;
@@ -1565,7 +1582,7 @@ async function openSettings() {
 
   try {
     const health = state.health || (await api.health());
-    state.health = health;
+    applyHealth(health);
     if (modalWrap.hidden) return;
     const auth = Boolean(health.authenticated);
     $("ytAuthFields").hidden = auth;
@@ -2220,6 +2237,7 @@ function bindPlayer() {
 function init() {
   bindEvents();
   bindPlayer();
+  refreshHealth();
 
   applyTheme(document.documentElement.dataset.theme || "light", false);
   player.setVolume(store.data.volume ?? 0.85);
