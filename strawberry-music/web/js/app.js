@@ -1447,6 +1447,10 @@ async function openSettings() {
           <label for="ytAuthHeaders">Paste headers from music.youtube.com</label>
           <textarea id="ytAuthHeaders" class="modal-input" rows="6" placeholder="Cookie=...; Authorization=..."></textarea>
         </div>
+        <p style="margin:0 0 10px;color:var(--muted,#7b7b86);font-size:13px;line-height:1.45">
+          Open music.youtube.com while signed in, press F12, open Network, click any request,
+          then copy the full Request Headers block and paste it here.
+        </p>
         <button class="btn primary" id="ytConnect">Connect YouTube Music</button>
       </div>
       <div id="ytDisconnectWrap" hidden>
@@ -1514,27 +1518,49 @@ async function openSettings() {
       toast("Paste the music.youtube.com headers first.");
       return;
     }
-    const data = await api.authConnect(headers);
-    if (modalWrap.hidden) return;
-    $("ytAuthFields").hidden = true;
-    $("ytDisconnectWrap").hidden = false;
-    $("ytAuthStatus").innerHTML = `
-      <div class="status-line">
-        <span><span class="dot-ok"></span>Library</span><span>connected</span>
-      </div>`;
-    toast("YouTube Music connected");
+    try {
+      const data = await api.authConnect(headers);
+      state.health = { ...(state.health || {}), ...data };
+      state.home = null;
+      state.homeAt = 0;
+      state.explore = null;
+      state.exploreAt = 0;
+      state.cache.clear();
+      if (modalWrap.hidden) return;
+      $("ytAuthFields").hidden = true;
+      $("ytDisconnectWrap").hidden = false;
+      $("ytAuthStatus").innerHTML = `
+        <div class="status-line">
+          <span><span class="dot-ok"></span>YouTube Music</span><span>connected</span>
+        </div>`;
+      toast("YouTube Music connected");
+      if (state.route.name === "home") route();
+    } catch (error) {
+      toast(error.message || "Could not connect YouTube Music");
+    }
   });
 
   $("ytDisconnect").addEventListener("click", async () => {
-    await api.authDisconnect();
-    if (modalWrap.hidden) return;
-    $("ytAuthFields").hidden = false;
-    $("ytDisconnectWrap").hidden = true;
-    $("ytAuthStatus").innerHTML = `
-      <div class="status-line">
-        <span><span class="dot-warn"></span>Library</span><span>on this device</span>
-      </div>`;
-    toast("YouTube Music disconnected");
+    try {
+      const data = await api.authDisconnect();
+      state.health = { ...(state.health || {}), ...data };
+      state.home = null;
+      state.homeAt = 0;
+      state.explore = null;
+      state.exploreAt = 0;
+      state.cache.clear();
+      if (modalWrap.hidden) return;
+      $("ytAuthFields").hidden = false;
+      $("ytDisconnectWrap").hidden = true;
+      $("ytAuthStatus").innerHTML = `
+        <div class="status-line">
+          <span><span class="dot-warn"></span>YouTube Music</span><span>on this device</span>
+        </div>`;
+      toast("YouTube Music disconnected");
+      if (state.route.name === "home") route();
+    } catch (error) {
+      toast(error.message || "Could not disconnect YouTube Music");
+    }
   });
 
   try {
@@ -1546,17 +1572,17 @@ async function openSettings() {
     $("ytDisconnectWrap").hidden = !auth;
     $("ytAuthStatus").innerHTML = `
       <div class="status-line">
-        <span><span class="${auth ? "dot-ok" : "dot-warn"}"></span>Library</span><span>${auth ? "connected" : "on this device"}</span>
+        <span><span class="${auth ? "dot-ok" : "dot-warn"}"></span>YouTube Music</span><span>${auth ? "connected" : "on this device"}</span>
       </div>`;
+    $("settingsStatus").innerHTML = `
       <div class="status-line">
         <span><span class="dot-ok"></span>API server</span><span>online</span>
       </div>
       <div class="status-line">
-        <span><span class="${auth ? "dot-ok" : "dot-warn"}"></span>Library</span>
-        <span>${auth ? "connected" : "on this device"}</span>
+        <span><span class="${auth ? "dot-ok" : "dot-warn"}"></span>YouTube Music</span><span>${auth ? "connected" : "on this device"}</span>
       </div>
       <div class="status-line">
-        <span>Region</span><span>${view.esc(health.country || "—")}</span>
+        <span>Region</span><span>${view.esc(health.country || "")}</span>
       </div>
       <div class="status-line">
         <span>Audio engine</span><span>ready</span>

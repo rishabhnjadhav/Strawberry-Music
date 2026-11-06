@@ -53,7 +53,7 @@ function plural(count, singular, pluralForm = `${singular}s`) {
 
 export function hashHue(text) {
   let hash = 0;
-  const value = String(text || "omni");
+  const value = String(text || "strawberry");
   for (let index = 0; index < value.length; index += 1) {
     hash = (hash * 31 + value.charCodeAt(index)) % 360;
   }
@@ -65,7 +65,7 @@ export function icon(name, className = "") {
 }
 
 export function artHTML(item, className = "") {
-  const seed = item?.title || item?.name || item?.playlistId || item?.browseId || "omni";
+  const seed = item?.title || item?.name || item?.playlistId || item?.browseId || "strawberry";
   const hue = hashHue(seed);
   const src = item?.thumb || item?.thumbnail || "";
   return `<div class="art ${className}" style="--h:${hue}">${

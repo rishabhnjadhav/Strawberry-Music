@@ -21,6 +21,6 @@ if errorlevel 1 (
 )
 
 if "%PORT%"=="" set PORT=8420
-start "" /b python -m uvicorn server.main:app --host 127.0.0.1 --port %PORT%
+start /b "" python -m uvicorn server.main:app --host 127.0.0.1 --port %PORT%
 timeout /t 3 /nobreak >nul
 start "" http://127.0.0.1:%PORT%

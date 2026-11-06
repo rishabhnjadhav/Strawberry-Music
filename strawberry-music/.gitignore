@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets and local auth
+auth.json
+server/auth.json
+cookies.txt
+server/cookies.txt
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+client_secret*
+secrets.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log

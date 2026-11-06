@@ -43,7 +43,7 @@ Before you commit, open GitHub Desktop and check the **Changes** list. You shoul
 2. Open GitHub Desktop and sign in with your GitHub account.
 3. Click **File → Add Local Repository**.
 4. Choose this folder:
-   `C:\Users\Rishabh Jadhav\Downloads\omni-music`
+   `C:\Users\Rishabh Jadhav\Downloads\strawberry-music`
 5. GitHub Desktop will say it is not a Git repository. Click **create a repository**.
 6. Use these values:
    - **Name:** `strawberry-music`

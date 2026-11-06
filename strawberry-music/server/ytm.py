@@ -13,8 +13,10 @@ All responses are normalised into small, frontend-friendly objects:
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -48,13 +50,32 @@ _auth_lock = threading.Lock()
 _client_generation = 0
 
 
+def _is_browser_auth_file(path: str) -> bool:
+    """Return True when *path* holds usable YouTube Music browser headers.
+
+    ``ytmusicapi.setup`` happily writes a file for incomplete headers, so an
+    existing file is not proof of a real session. Require the two values the
+    browser flow always supplies.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    cookie = str(data.get("cookie") or "").strip()
+    authorization = str(data.get("authorization") or "").strip()
+    return bool(cookie and authorization)
+
+
 def auth_path() -> str | None:
     global _auth_path
     with _auth_lock:
         if _auth_path is not None:
             return _auth_path or None
         for candidate in AUTH_CANDIDATES:
-            if candidate and os.path.exists(candidate):
+            if candidate and os.path.exists(candidate) and _is_browser_auth_file(candidate):
                 _auth_path = candidate
                 return candidate
         _auth_path = ""
@@ -83,7 +104,12 @@ def client() -> YTMusic:
 
 
 def connect(headers_raw: str) -> str:
-    """Validate browser headers and persist a YouTube Music session."""
+    """Validate browser headers and persist a YouTube Music session.
+
+    Headers are written to a temporary file first so a failed attempt can never
+    destroy an existing working session. The temporary session is then probed
+    against the account endpoint before it replaces the real auth file.
+    """
     global _auth_path
     text = (headers_raw or "").strip()
     if not text:
@@ -99,13 +125,31 @@ def connect(headers_raw: str) -> str:
     if parent:
         os.makedirs(parent, exist_ok=True)
 
+    handle, temp_path = tempfile.mkstemp(prefix=".ytm-auth-", suffix=".json", dir=parent or None)
+    os.close(handle)
     try:
-        ytmusicapi.setup(filepath=target, headers_raw=text)
-    except Exception as exc:  # noqa: BLE001
-        raise ValueError(str(exc) or "Those headers could not be validated.") from exc
-
-    if not os.path.exists(target):
-        raise ValueError("The sign-in did not create a session file.")
+        ytmusicapi.setup(filepath=temp_path, headers_raw=text)
+        if not _is_browser_auth_file(temp_path):
+            raise ValueError(
+                "Those headers are missing the Cookie or Authorization value. "
+                "Copy the full Request Headers block from music.youtube.com."
+            )
+        try:
+            info = YTMusic(temp_path).get_account_info()
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(
+                "YouTube Music rejected those headers. Sign in at music.youtube.com, "
+                "copy a fresh Request Headers block, and try again."
+            ) from exc
+        if not isinstance(info, dict) or not (info.get("accountName") or info.get("channelHandle")):
+            raise ValueError("YouTube Music did not return an account for those headers.")
+        os.replace(temp_path, target)
+    except Exception:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        raise
 
     with _auth_lock:
         _auth_path = target
@@ -116,12 +160,12 @@ def connect(headers_raw: str) -> str:
 
 def disconnect() -> None:
     global _auth_path
-    path = auth_path()
-    if path:
-        try:
-            os.remove(path)
-        except FileNotFoundError:
-            pass
+    for candidate in AUTH_CANDIDATES:
+        if candidate and os.path.exists(candidate):
+            try:
+                os.remove(candidate)
+            except OSError:
+                pass
     with _auth_lock:
         _auth_path = None
     reset_clients()

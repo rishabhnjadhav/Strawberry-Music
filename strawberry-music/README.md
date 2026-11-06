@@ -5,7 +5,7 @@ No build step, no frontend framework — a small FastAPI backend and vanilla
 ES-module JavaScript in the browser.
 
 ```
-omni-music/
+strawberry-music/
 ├── server/
 │   ├── main.py      FastAPI app, REST endpoints, audio proxy, static mount
 │   ├── ytm.py       catalog client, caches, normalisers, lyrics
@@ -40,7 +40,7 @@ Double-click `run.bat` (installs dependencies on first run and opens the browser
 or:
 
 ```powershell
-cd omni-music
+cd strawberry-music
 python -m pip install -r requirements.txt
 python -m uvicorn server.main:app --host 127.0.0.1 --port 8420
 ```
@@ -74,10 +74,14 @@ Get-NetTCPConnection -LocalPort 8420 | Select-Object -ExpandProperty OwningProce
 
 ## Optional session
 
-The app works without an account. For a more stable session, place a compatible
-`auth.json` session file in `omni-music/` (or `server/`), or point
-`OMNI_AUTH` at it, then restart the server. `/api/health` will report
-`"authenticated": true`.
+The app works without an account. To personalize Home with your own YouTube
+Music recommendations, open **Settings → YouTube Music**, copy the Request
+Headers block from a signed-in `music.youtube.com` tab, and paste it there.
+The session is stored in `auth.json` on the server and `/api/health` reports
+`"authenticated": true` while it is active.
+
+You can also place a compatible `auth.json` session file in the project folder
+(or `server/`), or point `OMNI_AUTH` at it, then restart the server.
 
 > Session files are local-only. Never commit `auth.json`.
 

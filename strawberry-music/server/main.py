@@ -1,6 +1,6 @@
 """Strawberry Music API server.
 
-Run from the omni-music directory:
+Run from the strawberry-music directory:
 
     python -m uvicorn server.main:app --host 127.0.0.1 --port 8420
 """
@@ -27,7 +27,7 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-7s %(message)s",
     datefmt="%H:%M:%S",
 )
-log = logging.getLogger("omni")
+log = logging.getLogger("strawberry")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(os.path.dirname(BASE_DIR), "web")

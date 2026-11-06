@@ -210,7 +210,7 @@ function next(manual = true) {
     if (state.autoplay) {
       extend().then((added) => {
         if (added > 0) next(false);
-        else if (manual) stopAtEnd();
+        else stopAtEnd();
       });
       return;
     }
