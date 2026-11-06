@@ -39,15 +39,16 @@ MIME_TYPES = {
 
 
 def clients() -> list[str]:
-    value = (
-        os.environ.get("OMNI_STREAM_CLIENTS")
-        or os.environ.get("OMNI_YTDLP_CLIENTS")
-        or "android"
-    )
-    return [client.strip() for client in value.split(",") if client.strip()]
+    value = os.environ.get("OMNI_STREAM_CLIENTS") or os.environ.get("OMNI_YTDLP_CLIENTS")
+    if value:
+        return [client.strip() for client in value.split(",") if client.strip()]
+    # The tv client does not require a PO token and works with account
+    # cookies, which is what a signed-in YouTube Music session provides.
+    # Anonymous requests fall back to android, which works on residential IPs.
+    return ["tv", "android"] if ytm.auth_path() else ["android"]
 
 
-def _base_options() -> dict:
+def _base_options(client: str | None = None) -> dict:
     options = {
         "format": "bestaudio[ext=m4a]/bestaudio/best",
         "quiet": True,
@@ -78,7 +79,7 @@ def _base_options() -> dict:
     proxy = os.environ.get("OMNI_PROXY")
     if proxy:
         options["proxy"] = proxy
-    extractor_args = {"player_client": clients()}
+    extractor_args = {"player_client": [client] if client else clients()}
     visitor = ytm.visitor_data()
     if visitor:
         extractor_args["visitor_data"] = [visitor]
@@ -164,35 +165,40 @@ def resolve(video_id: str, force: bool = False) -> dict:
                 if hit and hit["expires"] > now:
                     return hit
 
-        try:
-            with yt_dlp.YoutubeDL(_base_options()) as ydl:
-                info = ydl.extract_info(
-                    f"https://music.youtube.com/watch?v={video_id}", download=False
-                )
-            if info and info.get("entries"):
-                info = info["entries"][0]
-            if not info or not info.get("url"):
-                raise RuntimeError("No audio stream returned by the resolver")
+        last_error: Exception | None = None
+        for client in clients():
+            try:
+                with yt_dlp.YoutubeDL(_base_options(client)) as ydl:
+                    info = ydl.extract_info(
+                        f"https://music.youtube.com/watch?v={video_id}", download=False
+                    )
+                if info and info.get("entries"):
+                    info = info["entries"][0]
+                if not info or not info.get("url"):
+                    raise RuntimeError("No audio stream returned by the resolver")
 
-            ext = (info.get("ext") or "m4a").lower()
-            entry = {
-                "url": info["url"],
-                "ext": ext,
-                "mime": MIME_TYPES.get(ext, "audio/mp4"),
-                "title": info.get("title"),
-                "duration": info.get("duration"),
-                "expires": time.time() + STREAM_TTL,
-            }
-            with _guard:
-                _cache[video_id] = entry
-                _failures.pop(video_id, None)
-                _lock_seen[video_id] = time.time()
-                _trim_cache_locked()
-            return entry
-        except Exception as exc:  # noqa: BLE001 - surface a clean message
-            with _guard:
-                _failures[video_id] = time.time()
-            raise RuntimeError(str(exc) or "Audio extraction failed") from exc
+                ext = (info.get("ext") or "m4a").lower()
+                entry = {
+                    "url": info["url"],
+                    "ext": ext,
+                    "mime": MIME_TYPES.get(ext, "audio/mp4"),
+                    "title": info.get("title"),
+                    "duration": info.get("duration"),
+                    "expires": time.time() + STREAM_TTL,
+                }
+                with _guard:
+                    _cache[video_id] = entry
+                    _failures.pop(video_id, None)
+                    _lock_seen[video_id] = time.time()
+                    _trim_cache_locked()
+                return entry
+            except Exception as exc:  # noqa: BLE001 - try the next client
+                last_error = exc
+                continue
+
+        with _guard:
+            _failures[video_id] = time.time()
+        raise RuntimeError(str(last_error) or "Audio extraction failed") from last_error
 
 
 def prefetch(video_id: str) -> None:
