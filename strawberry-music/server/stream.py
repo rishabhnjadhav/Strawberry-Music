@@ -63,7 +63,7 @@ def _base_options() -> dict:
     clients = (
         os.environ.get("OMNI_STREAM_CLIENTS")
         or os.environ.get("OMNI_YTDLP_CLIENTS")
-        or "android"
+        or "android_vr"
     )
     options["extractor_args"] = {
         "youtube": {"player_client": [c.strip() for c in clients.split(",") if c.strip()]}
