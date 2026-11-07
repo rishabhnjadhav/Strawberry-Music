@@ -8,6 +8,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import requests
 import yt_dlp
 
 from . import ytm
@@ -36,6 +37,85 @@ MIME_TYPES = {
     "opus": "audio/ogg",
     "mp3": "audio/mpeg",
 }
+
+DEFAULT_INVIDIOUS = [
+    "https://yt.chocolatemoo53.com",
+    "https://inv.nadeko.net",
+    "https://invidious.nerdvpn.de",
+    "https://invidious.tiekoetter.com",
+]
+
+
+def invidious_instances() -> list[str]:
+    value = os.environ.get("OMNI_INVIDIOUS")
+    if value:
+        return [item.strip().rstrip("/") for item in value.split(",") if item.strip()]
+    return list(DEFAULT_INVIDIOUS)
+
+
+def _invidious_first() -> bool:
+    order = (os.environ.get("OMNI_STREAM_ORDER") or "").strip().lower()
+    if order:
+        return order == "invidious"
+    # Render's datacenter IP is usually challenged by YouTube for anonymous
+    # extraction, so use the proxy first there and keep yt-dlp as the fallback.
+    return bool(os.environ.get("RENDER"))
+
+
+def _resolve_invidious(video_id: str) -> dict | None:
+    """Resolve through a public Invidious proxy.
+
+    YouTube blocks anonymous extraction from many datacenter IPs. Invidious
+    instances resolve the video from their own network and expose a proxied
+    audio URL, which keeps playback working without asking every listener to
+    sign in. The first working instance wins.
+    """
+    for base in invidious_instances():
+        try:
+            response = requests.get(
+                f"{base}/api/v1/videos/{video_id}",
+                params={"local": "true"},
+                timeout=12,
+            )
+            if response.status_code != 200:
+                continue
+            data = response.json()
+            formats = data.get("adaptiveFormats") or []
+            audio = [
+                item
+                for item in formats
+                if str(item.get("type") or "").startswith("audio/") and item.get("url")
+            ]
+            if not audio:
+                continue
+            audio.sort(
+                key=lambda item: (
+                    1 if "mp4" in str(item.get("type") or "") else 0,
+                    item.get("bitrate") or 0,
+                ),
+                reverse=True,
+            )
+            best = audio[0]
+            mime = str(best.get("type") or "audio/mp4").split(";")[0].strip()
+            if "mp4" in mime:
+                ext = "m4a"
+            elif "webm" in mime:
+                ext = "webm"
+            elif "mpeg" in mime:
+                ext = "mp3"
+            else:
+                ext = "opus"
+            return {
+                "url": best["url"],
+                "ext": ext,
+                "mime": mime,
+                "title": data.get("title"),
+                "duration": data.get("lengthSeconds"),
+                "expires": time.time() + 60 * 60,
+            }
+        except Exception:  # noqa: BLE001 - try the next mirror
+            continue
+    return None
 
 
 def clients() -> list[str]:
@@ -165,6 +245,17 @@ def resolve(video_id: str, force: bool = False) -> dict:
                 if hit and hit["expires"] > now:
                     return hit
 
+        prefer_invidious = _invidious_first()
+        if prefer_invidious:
+            fallback = _resolve_invidious(video_id)
+            if fallback:
+                with _guard:
+                    _cache[video_id] = fallback
+                    _failures.pop(video_id, None)
+                    _lock_seen[video_id] = time.time()
+                    _trim_cache_locked()
+                return fallback
+
         last_error: Exception | None = None
         for client in clients():
             try:
@@ -195,6 +286,16 @@ def resolve(video_id: str, force: bool = False) -> dict:
             except Exception as exc:  # noqa: BLE001 - try the next client
                 last_error = exc
                 continue
+
+        if not prefer_invidious:
+            fallback = _resolve_invidious(video_id)
+            if fallback:
+                with _guard:
+                    _cache[video_id] = fallback
+                    _failures.pop(video_id, None)
+                    _lock_seen[video_id] = time.time()
+                    _trim_cache_locked()
+                return fallback
 
         with _guard:
             _failures[video_id] = time.time()

@@ -72,18 +72,29 @@ Get-NetTCPConnection -LocalPort 8420 | Select-Object -ExpandProperty OwningProce
 - **Queue drawer**, track context menus (play next, add to queue, like, start radio,
   go to artist/album, add to playlist), create/delete local playlists.
 
-## Optional session
+## Optional YouTube Music session
 
-The app works without an account. To personalize Home with your own YouTube
-Music recommendations, open **Settings → YouTube Music**, copy the Request
-Headers block from a signed-in `music.youtube.com` tab, and paste it there.
+Playback works without an account. Sign-in is optional and only personalizes
+Home with your own recommendations.
+
+The easiest way to connect:
+
+1. Install a cookie-export extension such as **Get cookies.txt LOCALLY**.
+2. Sign in at `music.youtube.com` and export cookies for that site.
+3. Open **Settings → YouTube Music**, upload the `cookies.txt` file, then click
+   **Connect YouTube Music**.
+
+You can also paste the `Cookie` header, or the full Request Headers block
+(DevTools → Network → Fetch/XHR → click a **browse** or **player** request).
+Cookie-only input is upgraded automatically by computing the `SAPISIDHASH`
+Authorization header, so you do not need to copy headers.
+
 The session is stored in `auth.json` on the server and `/api/health` reports
-`"authenticated": true` while it is active.
+`"authenticated": true` while it is active. You can also place a compatible
+`auth.json` session file in the project folder (or `server/`), or point
+`OMNI_AUTH` at it, then restart the server.
 
-You can also place a compatible `auth.json` session file in the project folder
-(or `server/`), or point `OMNI_AUTH` at it, then restart the server.
-
-> Session files are local-only. Never commit `auth.json`.
+> Session files are local-only. Never commit `auth.json` or `auth.cookies.txt`.
 
 ## Environment variables
 
@@ -91,9 +102,11 @@ You can also place a compatible `auth.json` session file in the project folder
 | --- | --- | --- |
 | `OMNI_AUTH` | – | Path to a session file |
 | `OMNI_COUNTRY` | `IN` | Catalog country/region code |
-| `OMNI_COOKIES` | – | Netscape cookies file for age/region-locked tracks |
+| `OMNI_COOKIES` | – | Optional Netscape cookies file for yt-dlp |
 | `OMNI_PROXY` | – | HTTP/SOCKS proxy for the stream resolver |
-| `OMNI_STREAM_CLIENTS` | `android` | Comma-separated resolver clients, e.g. `android,android_vr,ios` |
+| `OMNI_STREAM_CLIENTS` | `android` / `tv,android` | Resolver clients; `tv,android` is used when signed in |
+| `OMNI_STREAM_ORDER` | auto | `invidious` prefers the public proxy; auto uses it first on Render |
+| `OMNI_INVIDIOUS` | built-in list | Comma-separated Invidious bases for anonymous playback |
 
 Example:
 

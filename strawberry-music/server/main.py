@@ -264,8 +264,8 @@ def api_stream(video_id: str, request: Request):
             message = str(exc)
             if "Sign in to confirm" in message or "not a bot" in message:
                 detail = (
-                    "YouTube is blocking anonymous playback from this server. "
-                    "Open Settings → YouTube Music, connect your account, then try again."
+                    "Could not resolve audio for this track right now. Please try again. "
+                    "If it keeps happening, connect YouTube Music in Settings."
                 )
             else:
                 detail = (

@@ -84,13 +84,8 @@ function toast(message) {
   toast.timer = setTimeout(() => toastEl.classList.remove("show"), 2800);
 }
 
-function isLocalHost() {
-  return ["localhost", "127.0.0.1", "::1"].includes(location.hostname);
-}
-
 function applyHealth(health) {
   state.health = health;
-  player.setNeedsAuth(!isLocalHost() && !health?.authenticated);
 }
 
 async function refreshHealth() {
@@ -1457,16 +1452,29 @@ async function openSettings() {
       </div>
     </div>
     <div class="modal-field">
-      <label>YouTube Music</label>
+      <label>YouTube Music <span style="font-weight:400;color:var(--muted,#7b7b86)">(optional)</span></label>
+      <p style="margin:0 0 10px;color:var(--muted,#7b7b86);font-size:13px;line-height:1.45">
+        Playback works without an account. Connect YouTube Music only if you want
+        your own recommendations on Home.
+      </p>
       <div id="ytAuthStatus"><div class="status-line"><span>Checking…</span></div></div>
       <div id="ytAuthFields" hidden>
         <div class="modal-field">
-          <label for="ytAuthHeaders">Paste headers from music.youtube.com</label>
-          <textarea id="ytAuthHeaders" class="modal-input" rows="6" placeholder="Cookie=...; Authorization=..."></textarea>
+          <label for="ytCookieFile">Easiest: upload cookies.txt</label>
+          <input type="file" id="ytCookieFile" class="modal-input" accept=".txt,text/plain">
+          <p style="margin:6px 0 0;color:var(--muted,#7b7b86);font-size:12px;line-height:1.45">
+            Export cookies for <strong>music.youtube.com</strong> with a browser extension
+            such as “Get cookies.txt LOCALLY”, then choose the file here.
+          </p>
+        </div>
+        <div class="modal-field">
+          <label for="ytAuthHeaders">Or paste the Cookie header</label>
+          <textarea id="ytAuthHeaders" class="modal-input" rows="4" placeholder="SAPISID=...; SID=...; HSID=..."></textarea>
         </div>
         <p style="margin:0 0 10px;color:var(--muted,#7b7b86);font-size:13px;line-height:1.45">
-          Open music.youtube.com while signed in, press F12, open Network, click any request,
-          then copy the full Request Headers block and paste it here.
+          Advanced: DevTools → Network → Fetch/XHR → click a <strong>browse</strong> or
+          <strong>player</strong> request → copy the <strong>Cookie</strong> header
+          (or the full Request Headers block).
         </p>
         <button class="btn primary" id="ytConnect">Connect YouTube Music</button>
       </div>
@@ -1529,10 +1537,21 @@ async function openSettings() {
     );
   });
 
+  $("ytCookieFile").addEventListener("change", async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    try {
+      $("ytAuthHeaders").value = await file.text();
+      toast("Cookies loaded. Click Connect YouTube Music.");
+    } catch {
+      toast("Could not read that file.");
+    }
+  });
+
   $("ytConnect").addEventListener("click", async () => {
     const headers = $("ytAuthHeaders").value.trim();
     if (!headers) {
-      toast("Paste the music.youtube.com headers first.");
+      toast("Upload cookies.txt or paste the Cookie header first.");
       return;
     }
     try {
@@ -1571,7 +1590,7 @@ async function openSettings() {
       $("ytDisconnectWrap").hidden = true;
       $("ytAuthStatus").innerHTML = `
         <div class="status-line">
-          <span><span class="dot-warn"></span>YouTube Music</span><span>on this device</span>
+          <span><span class="dot-warn"></span>YouTube Music</span><span>not connected</span>
         </div>`;
       toast("YouTube Music disconnected");
       if (state.route.name === "home") route();
@@ -1589,14 +1608,14 @@ async function openSettings() {
     $("ytDisconnectWrap").hidden = !auth;
     $("ytAuthStatus").innerHTML = `
       <div class="status-line">
-        <span><span class="${auth ? "dot-ok" : "dot-warn"}"></span>YouTube Music</span><span>${auth ? "connected" : "on this device"}</span>
+        <span><span class="${auth ? "dot-ok" : "dot-warn"}"></span>YouTube Music</span><span>${auth ? "connected" : "not connected"}</span>
       </div>`;
     $("settingsStatus").innerHTML = `
       <div class="status-line">
         <span><span class="dot-ok"></span>API server</span><span>online</span>
       </div>
       <div class="status-line">
-        <span><span class="${auth ? "dot-ok" : "dot-warn"}"></span>YouTube Music</span><span>${auth ? "connected" : "on this device"}</span>
+        <span><span class="${auth ? "dot-ok" : "dot-warn"}"></span>YouTube Music</span><span>${auth ? "connected" : "not connected"}</span>
       </div>
       <div class="status-line">
         <span>Region</span><span>${view.esc(health.country || "")}</span>

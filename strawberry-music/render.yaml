@@ -12,3 +12,5 @@ services:
         value: 3.12.4
       - key: PYTHONUNBUFFERED
         value: "1"
+      - key: OMNI_STREAM_ORDER
+        value: invidious

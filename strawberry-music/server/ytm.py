@@ -13,6 +13,7 @@ All responses are normalised into small, frontend-friendly objects:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -103,17 +104,107 @@ def client() -> YTMusic:
     return instance
 
 
-def connect(headers_raw: str) -> str:
-    """Validate browser headers and persist a YouTube Music session.
+def _parse_cookie_pairs(text: str) -> dict[str, str]:
+    text = re.sub(r"^\s*cookie\s*:\s*", "", text, flags=re.I)
+    pairs: dict[str, str] = {}
+    for part in text.split(";"):
+        if "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if name and value:
+            pairs[name] = value
+    return pairs
 
-    Headers are written to a temporary file first so a failed attempt can never
-    destroy an existing working session. The temporary session is then probed
-    against the account endpoint before it replaces the real auth file.
+
+def _parse_netscape_cookies(text: str) -> dict[str, str]:
+    pairs: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#HttpOnly_"):
+            line = line[len("#HttpOnly_"):]
+        elif line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 7:
+            parts = line.split()
+        if len(parts) < 7:
+            continue
+        domain, name, value = parts[0], parts[5], parts[6]
+        if "youtube.com" in domain or "google.com" in domain:
+            pairs[name] = value
+    return pairs
+
+
+def _sapisid_authorization(sapisid: str) -> str:
+    timestamp = int(time.time())
+    origin = "https://music.youtube.com"
+    digest = hashlib.sha1(f"{timestamp} {sapisid} {origin}".encode("utf-8")).hexdigest()
+    return f"SAPISIDHASH {timestamp}_{digest}"
+
+
+def _headers_from_cookies(cookies: dict[str, str], sapisid_key: str) -> str:
+    cookie_header = "; ".join(f"{name}={value}" for name, value in cookies.items())
+    return "\n".join(
+        (
+            f"Cookie: {cookie_header}",
+            f"Authorization: {_sapisid_authorization(cookies[sapisid_key])}",
+            "X-Goog-AuthUser: 0",
+            "Origin: https://music.youtube.com",
+            f"User-Agent: {USER_AGENT}",
+        )
+    )
+
+
+def _auth_header_candidates(raw: str) -> list[str]:
+    """Turn a cookie string, cookies.txt export, or full headers into candidates."""
+    text = (raw or "").strip()
+    if not text:
+        raise ValueError(
+            "Paste the YouTube Music cookie or Request Headers, or upload a cookies.txt file."
+        )
+
+    lower = text.lower()
+    if "authorization:" in lower and "cookie:" in lower:
+        return [text]
+
+    cookies: dict[str, str] | None = None
+    if text.startswith("# Netscape") or "\t" in text:
+        cookies = _parse_netscape_cookies(text)
+    elif "cookie:" in lower:
+        for line in text.splitlines():
+            if line.lower().startswith("cookie:"):
+                cookies = _parse_cookie_pairs(line.split(":", 1)[1])
+                break
+    else:
+        cookies = _parse_cookie_pairs(text)
+
+    if cookies:
+        candidates = []
+        for key in ("SAPISID", "__Secure-3PAPISID", "__Secure-1PAPISID"):
+            if cookies.get(key):
+                candidates.append(_headers_from_cookies(cookies, key))
+        if candidates:
+            return candidates
+    return [text]
+
+
+def connect(headers_raw: str) -> str:
+    """Validate a YouTube Music session and persist it.
+
+    Accepts a full Request Headers block, a raw Cookie value, or a Netscape
+    cookies.txt export. Cookie-only input is upgraded by computing the
+    SAPISIDHASH Authorization header, so users do not have to copy headers.
+
+    Each candidate is written to a temporary file and probed against the
+    account endpoint before it replaces the real auth file, so a failed attempt
+    can never destroy an existing working session.
     """
     global _auth_path
-    text = (headers_raw or "").strip()
-    if not text:
-        raise ValueError("Paste the request headers from music.youtube.com to sign in.")
+    candidates = _auth_header_candidates(headers_raw)
 
     target = (
         os.environ.get("OMNI_AUTH")
@@ -125,31 +216,42 @@ def connect(headers_raw: str) -> str:
     if parent:
         os.makedirs(parent, exist_ok=True)
 
-    handle, temp_path = tempfile.mkstemp(prefix=".ytm-auth-", suffix=".json", dir=parent or None)
-    os.close(handle)
-    try:
-        ytmusicapi.setup(filepath=temp_path, headers_raw=text)
-        if not _is_browser_auth_file(temp_path):
-            raise ValueError(
-                "Those headers are missing the Cookie or Authorization value. "
-                "Copy the full Request Headers block from music.youtube.com."
-            )
+    last_error: Exception | None = None
+    for headers in candidates:
+        handle, temp_path = tempfile.mkstemp(
+            prefix=".ytm-auth-", suffix=".json", dir=parent or None
+        )
+        os.close(handle)
         try:
-            info = YTMusic(temp_path).get_account_info()
-        except Exception as exc:  # noqa: BLE001
-            raise ValueError(
-                "YouTube Music rejected those headers. Sign in at music.youtube.com, "
-                "copy a fresh Request Headers block, and try again."
-            ) from exc
-        if not isinstance(info, dict) or not (info.get("accountName") or info.get("channelHandle")):
-            raise ValueError("YouTube Music did not return an account for those headers.")
-        os.replace(temp_path, target)
-    except Exception:
-        try:
-            os.remove(temp_path)
-        except OSError:
-            pass
-        raise
+            ytmusicapi.setup(filepath=temp_path, headers_raw=headers)
+            if not _is_browser_auth_file(temp_path):
+                raise ValueError(
+                    "That session is missing the Cookie or Authorization value. "
+                    "Export cookies for music.youtube.com and try again."
+                )
+            try:
+                info = YTMusic(temp_path).get_account_info()
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(
+                    "YouTube Music rejected that session. Sign in at music.youtube.com, "
+                    "export fresh cookies, and try again."
+                ) from exc
+            if not isinstance(info, dict) or not (info.get("accountName") or info.get("channelHandle")):
+                raise ValueError("YouTube Music did not return an account for that session.")
+            os.replace(temp_path, target)
+            last_error = None
+            break
+        except Exception as exc:  # noqa: BLE001 - try the next cookie candidate
+            last_error = exc
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+    if last_error is not None:
+        raise last_error
+    if not os.path.exists(target):
+        raise ValueError("The sign-in did not create a session file.")
 
     with _auth_lock:
         _auth_path = target
