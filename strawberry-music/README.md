@@ -96,6 +96,14 @@ The session is stored in `auth.json` on the server and `/api/health` reports
 
 > Session files are local-only. Never commit `auth.json` or `auth.cookies.txt`.
 
+### How playback works
+
+The server asks YouTube Music's player endpoint for the track, then solves the
+signature challenge with a local JavaScript runtime. If Node or Deno is missing,
+a pinned QuickJS binary is downloaded automatically and verified by SHA-256.
+When that path is unavailable, the server falls back to a public Invidious proxy
+and finally to yt-dlp. No account is required for any of these paths.
+
 ## Environment variables
 
 | Variable | Default | Purpose |

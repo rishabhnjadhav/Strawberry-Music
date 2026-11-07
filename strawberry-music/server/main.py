@@ -54,6 +54,9 @@ async def lifespan(_: FastAPI):
             log.warning("Could not warm home feed: %s", exc)
 
     threading.Thread(target=warm, daemon=True, name="home-warmup").start()
+    threading.Thread(
+        target=stream.ensure_js_runtime, daemon=True, name="js-runtime"
+    ).start()
     try:
         yield
     finally:
@@ -92,6 +95,7 @@ def health():
         "version": app.version,
         **ytm.status(),
         "streams": stream.cache_info(),
+        "jsRuntime": stream.runtime_info(),
     }
 
 

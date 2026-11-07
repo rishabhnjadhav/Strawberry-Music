@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+import platform
 import re
+import shutil
 import threading
 import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import parse_qs, quote
 
 import requests
 import yt_dlp
@@ -37,6 +42,293 @@ MIME_TYPES = {
     "opus": "audio/ogg",
     "mp3": "audio/mpeg",
 }
+
+_jsc_lock = threading.Lock()
+_jsc_director = None
+_jsc_disabled = False
+_player_lock = threading.Lock()
+_player_cache: dict = {"at": 0.0, "sts": None, "player_url": None}
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RUNTIME_DIR = os.path.join(PROJECT_ROOT, ".bin")
+_QUICKJS_VERSION = "0.18.0"
+_QUICKJS_ASSETS = {
+    ("linux", "x86_64"): (
+        "qjs-linux-x86_64",
+        "85DED23B9FABE8C1644FC40A8D2BBDD71157AFFCBD807359C618CC717EE24D7D",
+    ),
+    ("windows", "x86_64"): (
+        "qjs-windows-x86_64.exe",
+        "FF03398D74EA6E6BD3A8E58058F7003225ABCAC229D7D57775B7AAAE812A49C7",
+    ),
+}
+_runtime_lock = threading.Lock()
+_runtime_attempted = False
+
+
+def _runtime_platform() -> tuple[str, str]:
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    if machine in ("amd64",):
+        machine = "x86_64"
+    elif machine in ("arm64",):
+        machine = "aarch64"
+    return system, machine
+
+
+def _quickjs_path() -> str | None:
+    found = shutil.which("qjs")
+    if found:
+        return found
+    candidate = os.path.join(RUNTIME_DIR, "qjs.exe" if os.name == "nt" else "qjs")
+    return candidate if os.path.exists(candidate) else None
+
+
+def _js_runtimes() -> dict:
+    runtimes: dict = {}
+    for name in ("node", "deno"):
+        if shutil.which(name):
+            runtimes[name] = {}
+    quickjs = _quickjs_path()
+    if quickjs:
+        runtimes["quickjs"] = {"path": quickjs}
+    return runtimes
+
+
+def js_runtime_available() -> bool:
+    return bool(_js_runtimes())
+
+
+def runtime_info() -> dict:
+    runtimes = _js_runtimes()
+    return {"available": bool(runtimes), "runtimes": sorted(runtimes)}
+
+
+def ensure_js_runtime() -> bool:
+    """Download the pinned QuickJS binary when no JS runtime is installed.
+
+    yt-dlp needs a JavaScript runtime to solve YouTube signature/n challenges
+    for the catalog player endpoint. Render's Python image may not include one,
+    so the small QuickJS-ng binary is fetched once and verified by SHA-256.
+    """
+    global _runtime_attempted
+    if js_runtime_available():
+        return True
+    with _runtime_lock:
+        if js_runtime_available():
+            return True
+        if _runtime_attempted:
+            return False
+        _runtime_attempted = True
+        asset = _QUICKJS_ASSETS.get(_runtime_platform())
+        if not asset:
+            return False
+        asset_name, expected_hash = asset
+        url = (
+            f"https://github.com/quickjs-ng/quickjs/releases/download/"
+            f"v{_QUICKJS_VERSION}/{asset_name}"
+        )
+        target = os.path.join(RUNTIME_DIR, "qjs.exe" if os.name == "nt" else "qjs")
+        try:
+            os.makedirs(RUNTIME_DIR, exist_ok=True)
+            with urllib.request.urlopen(url, timeout=60) as response:
+                payload = response.read()
+            if hashlib.sha256(payload).hexdigest().upper() != expected_hash:
+                return False
+            temp_path = f"{target}.tmp"
+            with open(temp_path, "wb") as handle:
+                handle.write(payload)
+            os.chmod(temp_path, 0o755)
+            os.replace(temp_path, target)
+            return True
+        except Exception:  # noqa: BLE001 - fall back to other resolvers
+            return False
+
+
+def _get_jsc_director():
+    """Build a yt-dlp JS challenge director for signature/n solving."""
+    global _jsc_director, _jsc_disabled
+    if _jsc_disabled:
+        return None
+    with _jsc_lock:
+        if _jsc_director is not None:
+            return _jsc_director
+        try:
+            from yt_dlp.extractor.youtube import YoutubeIE
+            from yt_dlp.extractor.youtube.jsc._director import initialize_jsc_director
+
+            runtimes = _js_runtimes()
+            if not runtimes:
+                _jsc_disabled = True
+                return None
+            ydl = yt_dlp.YoutubeDL(
+                {
+                    "quiet": True,
+                    "no_warnings": True,
+                    "js_runtimes": runtimes,
+                    "remote_components": {"ejs:github"},
+                }
+            )
+            _jsc_director = initialize_jsc_director(YoutubeIE(ydl))
+        except Exception:  # noqa: BLE001 - fall back to other resolvers
+            _jsc_disabled = True
+            _jsc_director = None
+        return _jsc_director
+
+
+def _player_info(client) -> tuple[int | None, str | None]:
+    now = time.time()
+    with _player_lock:
+        if _player_cache["sts"] and now - _player_cache["at"] < 3600:
+            return _player_cache["sts"], _player_cache["player_url"]
+    player_url = client.get_basejs_url()
+    sts = client.get_signatureTimestamp(player_url)
+    with _player_lock:
+        _player_cache.update(at=time.time(), sts=sts, player_url=player_url)
+    return sts, player_url
+
+
+def _solve_sig(signature: str, player_url: str) -> str | None:
+    director = _get_jsc_director()
+    if director is None:
+        return None
+    try:
+        from yt_dlp.extractor.youtube.jsc.provider import (
+            JsChallengeRequest,
+            JsChallengeType,
+            SigChallengeInput,
+        )
+
+        dummy = "".join(map(chr, range(len(signature))))
+        request = JsChallengeRequest(
+            type=JsChallengeType.SIG,
+            input=SigChallengeInput(challenges=[dummy], player_url=player_url),
+        )
+        with _jsc_lock:
+            results = director.bulk_solve([request])
+        for _, response in results:
+            if response.type == JsChallengeType.SIG:
+                spec = [ord(char) for char in response.output.results[dummy]]
+                return "".join(signature[index] for index in spec)
+    except Exception:  # noqa: BLE001 - fall back to other resolvers
+        return None
+    return None
+
+
+def _solve_n(challenge: str, player_url: str) -> str | None:
+    director = _get_jsc_director()
+    if director is None:
+        return None
+    try:
+        from yt_dlp.extractor.youtube.jsc.provider import (
+            JsChallengeRequest,
+            JsChallengeType,
+            NChallengeInput,
+        )
+
+        request = JsChallengeRequest(
+            type=JsChallengeType.N,
+            input=NChallengeInput(challenges=[challenge], player_url=player_url),
+        )
+        with _jsc_lock:
+            results = director.bulk_solve([request])
+        for _, response in results:
+            if response.type == JsChallengeType.N:
+                return response.output.results[challenge]
+    except Exception:  # noqa: BLE001 - fall back to other resolvers
+        return None
+    return None
+
+
+def _resolve_ytmusic(video_id: str) -> dict | None:
+    """Resolve audio through the catalog player endpoint and yt-dlp's JS solver.
+
+    The catalog client keeps working from datacenter IPs where yt-dlp's
+    anonymous clients are challenged. Its player response contains ciphered
+    URLs, so a local JS runtime solves the signature/n challenges.
+    """
+    if not js_runtime_available() and not ensure_js_runtime():
+        return None
+    try:
+        client = ytm.client()
+        signature_timestamp, player_url = _player_info(client)
+        if not signature_timestamp or not player_url:
+            return None
+        song = client.get_song(video_id, signatureTimestamp=signature_timestamp)
+        if (song.get("playabilityStatus") or {}).get("status") != "OK":
+            return None
+        formats = (song.get("streamingData") or {}).get("adaptiveFormats") or []
+        if not isinstance(formats, list):
+            return None
+        audio = [
+            item
+            for item in formats
+            if str(item.get("mimeType") or "").startswith("audio/")
+        ]
+        if not audio:
+            return None
+        audio.sort(
+            key=lambda item: (
+                1 if "mp4" in str(item.get("mimeType") or "") else 0,
+                item.get("bitrate") or 0,
+            ),
+            reverse=True,
+        )
+        best = audio[0]
+        mime = str(best.get("mimeType") or "audio/mp4").split(";")[0].strip()
+        if "mp4" in mime:
+            ext = "m4a"
+        elif "webm" in mime:
+            ext = "webm"
+        elif "mpeg" in mime:
+            ext = "mp3"
+        else:
+            ext = "opus"
+
+        url = best.get("url")
+        if not url:
+            cipher = best.get("signatureCipher")
+            if not cipher:
+                return None
+            values = parse_qs(cipher)
+            url = (values.get("url") or [None])[0]
+            encrypted = (values.get("s") or [None])[0]
+            signature_param = (values.get("sp") or ["signature"])[0]
+            if not url or not encrypted:
+                return None
+            signature = _solve_sig(encrypted, player_url)
+            if not signature:
+                return None
+            url = f"{url}&{signature_param}={signature}"
+
+        if "n=" in url:
+            match = re.search(r"([?&])n=([^&]+)", url)
+            if match:
+                solved_n = _solve_n(match.group(2), player_url)
+                if not solved_n:
+                    return None
+                url = (
+                    url[: match.start(2)]
+                    + quote(solved_n, safe="")
+                    + url[match.end(2) :]
+                )
+
+        details = song.get("videoDetails") or {}
+        try:
+            duration = int(details.get("lengthSeconds"))
+        except (TypeError, ValueError):
+            duration = None
+        return {
+            "url": url,
+            "ext": ext,
+            "mime": mime,
+            "title": details.get("title"),
+            "duration": duration,
+            "expires": time.time() + 60 * 60,
+        }
+    except Exception:  # noqa: BLE001 - fall back to other resolvers
+        return None
+
 
 DEFAULT_INVIDIOUS = [
     "https://yt.chocolatemoo53.com",
@@ -81,6 +373,8 @@ def _resolve_invidious(video_id: str) -> dict | None:
                 continue
             data = response.json()
             formats = data.get("adaptiveFormats") or []
+            if not isinstance(formats, list):
+                continue
             audio = [
                 item
                 for item in formats
@@ -88,6 +382,11 @@ def _resolve_invidious(video_id: str) -> dict | None:
             ]
             if not audio:
                 continue
+            # Prefer URLs proxied by the instance itself. A raw googlevideo URL
+            # is bound to the instance's IP and would fail from our server.
+            proxied = [item for item in audio if str(item["url"]).startswith(base)]
+            if proxied:
+                audio = proxied
             audio.sort(
                 key=lambda item: (
                     1 if "mp4" in str(item.get("type") or "") else 0,
@@ -247,6 +546,14 @@ def resolve(video_id: str, force: bool = False) -> dict:
 
         prefer_invidious = _invidious_first()
         if prefer_invidious:
+            entry = _resolve_ytmusic(video_id)
+            if entry:
+                with _guard:
+                    _cache[video_id] = entry
+                    _failures.pop(video_id, None)
+                    _lock_seen[video_id] = time.time()
+                    _trim_cache_locked()
+                return entry
             fallback = _resolve_invidious(video_id)
             if fallback:
                 with _guard:
@@ -288,6 +595,14 @@ def resolve(video_id: str, force: bool = False) -> dict:
                 continue
 
         if not prefer_invidious:
+            entry = _resolve_ytmusic(video_id)
+            if entry:
+                with _guard:
+                    _cache[video_id] = entry
+                    _failures.pop(video_id, None)
+                    _lock_seen[video_id] = time.time()
+                    _trim_cache_locked()
+                return entry
             fallback = _resolve_invidious(video_id)
             if fallback:
                 with _guard:
