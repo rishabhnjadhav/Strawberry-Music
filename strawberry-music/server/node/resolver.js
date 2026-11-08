@@ -347,6 +347,14 @@ server.listen(port, '127.0.0.1', () => {
   const actualPort = typeof address === 'object' && address ? address.port : port;
   // The Python supervisor reads this line to discover the ephemeral port.
   console.log(`SIDECAR_PORT=${actualPort}`);
+
+  // Create the visitor session in the background so the first playback does
+  // not have to wait for it.
+  getSession().catch((error) => {
+    console.error(
+      `[resolver] session warmup failed: ${String(error?.message || error).slice(0, 200)}`,
+    );
+  });
 });
 
 function shutdown() {
