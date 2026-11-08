@@ -19,6 +19,12 @@ cookies.txt
 # Downloaded JavaScript runtime
 .bin/
 *.tmp
+
+# Node resolver dependencies (the bundled resolver is committed)
+node_modules/
+server/node/node_modules/
+server/node/out.log
+server/node/err.log
 server/cookies.txt
 *.cookies.txt
 .env

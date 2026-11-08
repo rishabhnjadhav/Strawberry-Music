@@ -115,7 +115,25 @@ Open these in your browser:
 3. Use the search bar to find a song.
 4. Play a song. Test pause, next, previous, volume, and the queue.
 
-If search works but playback fails, open the Render **Logs** tab. YouTube sometimes blocks cloud servers. You can try adding this environment variable in Render:
+Playback does not require a YouTube Music account. The primary resolver is a
+pre-bundled YouTube.js sidecar that runs next to the Python server. If Render's
+Python runtime does not already have Node.js, the server downloads a pinned
+official Node.js build (about 25 MB) into `.bin/` on first use and verifies it
+by SHA-256. This happens in the background, so the site can load immediately.
+The first playback may wait a few seconds while the resolver starts.
+
+The sidecar tries the `VISIONOS`, `YTMUSIC`, `WEB` and `MWEB` clients in order,
+preferring Opus and falling back to AAC. BotGuard PO tokens are generated with
+`bgutils-js` only as a fallback for web clients. If the sidecar is unavailable,
+the server falls back to the YouTube Music player endpoint with a local
+JavaScript solver, then a public Invidious proxy, and finally `yt-dlp`.
+
+If Render does not auto-deploy after a GitHub push, open the service in the
+Render dashboard and use **Manual Deploy → Deploy latest commit**.
+
+If search works but playback still fails, open the Render **Logs** tab. YouTube
+sometimes blocks cloud servers. You can try adding this environment variable in
+Render:
 
 - **Key:** `OMNI_STREAM_CLIENTS`
 - **Value:** `web,android`
@@ -198,6 +216,9 @@ After Render says the domain is verified:
 | Health check path | `/api/health` |
 | Plan | Free |
 | Python version | `3.12.4` (or `3.11.9` if unavailable) |
+| Stream order | `OMNI_STREAM_ORDER=youtubei` |
+| Node version | `OMNI_NODE_VERSION=22.11.0` |
+| PO-token fallback | `OMNI_PO_TOKEN=1` |
 
 ---
 

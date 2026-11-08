@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
+import time
 from contextlib import asynccontextmanager
 
 import requests
@@ -20,7 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import stream, ytm
+from . import node_runtime, stream, ytm
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,6 +58,9 @@ async def lifespan(_: FastAPI):
     threading.Thread(target=warm, daemon=True, name="home-warmup").start()
     threading.Thread(
         target=stream.ensure_js_runtime, daemon=True, name="js-runtime"
+    ).start()
+    threading.Thread(
+        target=node_runtime.start_sidecar, daemon=True, name="node-resolver"
     ).start()
     try:
         yield
@@ -96,6 +101,7 @@ def health():
         **ytm.status(),
         "streams": stream.cache_info(),
         "jsRuntime": stream.runtime_info(),
+        "nodeResolver": node_runtime.info(),
     }
 
 
@@ -215,111 +221,268 @@ def api_prefetch(video_id: str):
 
 
 # --------------------------------------------------------------------------
-# Audio proxy (supports HTTP range requests so seeking works)
+# Audio proxy (Range-aware, 1 MiB upstream reads, mid-track refresh)
 # --------------------------------------------------------------------------
 
+STREAM_CHUNK = 1024 * 1024
+UPSTREAM_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+    ),
+    "Accept": "*/*",
+    "Accept-Encoding": "identity",
+}
 
-def _stream_chunks(response: requests.Response):
-    try:
-        for chunk in response.iter_content(chunk_size=64 * 1024):
-            if chunk:
-                yield chunk
-    finally:
-        response.close()
+RATE_LIMIT = 180
+RATE_WINDOW = 60.0
+_rate_lock = threading.Lock()
+_rate_hits: dict[str, list[float]] = {}
 
 
-def _stream_headers(upstream: requests.Response, mime: str) -> dict[str, str]:
-    passthrough: dict[str, str] = {}
-    for header in (
-        "content-type",
-        "content-length",
-        "content-range",
-        "accept-ranges",
-        "etag",
-        "last-modified",
-    ):
-        value = upstream.headers.get(header)
-        if value:
-            passthrough[header] = value
-    # Content-Range is only valid on 206/416 responses, never on a plain 200.
-    if upstream.status_code == 200:
-        passthrough.pop("content-range", None)
-    passthrough.setdefault("content-type", mime)
-    passthrough.setdefault("accept-ranges", "bytes")
-    passthrough["cache-control"] = "no-store"
-    return passthrough
+def _rate_limit(request: Request) -> None:
+    client = request.client.host if request.client else "unknown"
+    now = time.time()
+    with _rate_lock:
+        hits = [stamp for stamp in _rate_hits.get(client, []) if now - stamp < RATE_WINDOW]
+        if len(hits) >= RATE_LIMIT:
+            _rate_hits[client] = hits
+            raise HTTPException(
+                status_code=429,
+                detail="Too many audio requests. Please wait a moment.",
+                headers={"Retry-After": "30"},
+            )
+        hits.append(now)
+        _rate_hits[client] = hits
+        if len(_rate_hits) > 2048:
+            for key, values in list(_rate_hits.items()):
+                if not values or now - values[-1] > RATE_WINDOW:
+                    _rate_hits.pop(key, None)
+
+
+def _parse_range(
+    range_header: str | None, total: int | None
+) -> tuple[int, int | None, int]:
+    if not range_header:
+        if total:
+            return 0, total - 1, 200
+        # Unknown total: serve one bounded chunk so the browser can keep
+        # asking for ranges as playback continues.
+        return 0, STREAM_CHUNK - 1, 206
+
+    match = re.match(r"^bytes=(\d*)-(\d*)$", range_header.strip())
+    if not match:
+        raise ValueError("Unsupported range")
+
+    start_text, end_text = match.groups()
+    if not start_text and not end_text:
+        raise ValueError("Invalid range")
+    if total is None:
+        raise ValueError("Unknown content length")
+
+    if not start_text:
+        suffix = int(end_text)
+        if suffix <= 0:
+            raise ValueError("Invalid suffix range")
+        start = max(0, total - suffix)
+        end = total - 1
+    else:
+        start = int(start_text)
+        end = int(end_text) if end_text else total - 1
+
+    if start >= total or start > end:
+        raise ValueError("Range not satisfiable")
+    return start, min(end, total - 1), 206
+
+
+def _probe_total(video_id: str, entry: dict) -> int | None:
+    for _ in range(2):
+        try:
+            upstream = requests.get(
+                entry["url"],
+                headers={**UPSTREAM_HEADERS, "Range": "bytes=0-0"},
+                stream=True,
+                timeout=(15, 30),
+                allow_redirects=True,
+            )
+        except requests.RequestException:
+            return None
+
+        if upstream.status_code in (401, 403, 410):
+            upstream.close()
+            try:
+                entry = stream.refresh(video_id, entry.get("itag"))
+            except Exception:  # noqa: BLE001
+                return None
+            continue
+
+        if upstream.status_code == 206:
+            content_range = upstream.headers.get("content-range") or ""
+            upstream.close()
+            match = re.match(r"bytes\s+\d+-\d+/(\d+)", content_range)
+            if match:
+                return int(match.group(1))
+            return None
+
+        if upstream.status_code == 200:
+            length = upstream.headers.get("content-length")
+            upstream.close()
+            if length and length.isdigit():
+                return int(length)
+            return None
+
+        upstream.close()
+        return None
+    return None
+
+
+def _read_range(video_id: str, entry: dict, start: int, end: int) -> tuple[bytes, dict]:
+    """Read one bounded range, refreshing the URL after a mid-track 403."""
+    if end < start:
+        return b"", entry
+
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            upstream = requests.get(
+                entry["url"],
+                headers={**UPSTREAM_HEADERS, "Range": f"bytes={start}-{end}"},
+                stream=True,
+                timeout=(15, 60),
+                allow_redirects=True,
+            )
+        except requests.RequestException as exc:
+            last_error = exc
+            time.sleep(0.2 * (attempt + 1))
+            continue
+
+        if upstream.status_code in (401, 403, 410):
+            upstream.close()
+            try:
+                entry = stream.refresh(video_id, entry.get("itag"))
+            except stream.UnplayableError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                break
+            continue
+
+        if upstream.status_code == 416:
+            upstream.close()
+            raise HTTPException(status_code=416, detail="Requested range is not satisfiable")
+
+        if upstream.status_code >= 400:
+            upstream.close()
+            last_error = RuntimeError(f"upstream returned HTTP {upstream.status_code}")
+            continue
+
+        remaining = end - start + 1
+        buffer = bytearray()
+        try:
+            for chunk in upstream.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                buffer.extend(chunk)
+                if len(buffer) >= remaining:
+                    del buffer[remaining:]
+                    break
+        finally:
+            upstream.close()
+
+        if len(buffer) < remaining:
+            last_error = RuntimeError("upstream closed the range early")
+            continue
+        return bytes(buffer), entry
+
+    raise HTTPException(
+        status_code=502,
+        detail=f"Audio upstream error: {last_error or 'could not read the requested range'}",
+    )
+
+
+def _iter_chunks(video_id: str, entry: dict, start: int, end: int):
+    position = start
+    while position <= end:
+        chunk_end = min(position + STREAM_CHUNK - 1, end)
+        data, entry = _read_range(video_id, entry, position, chunk_end)
+        if data:
+            yield data
+        position = chunk_end + 1
 
 
 @app.api_route("/api/stream/{video_id}", methods=["GET", "HEAD"])
 def api_stream(video_id: str, request: Request):
-    headers = {"Accept-Encoding": "identity"}
-    range_header = request.headers.get("range")
-    if range_header:
-        headers["Range"] = range_header
+    _rate_limit(request)
 
-    attempts = 0
-    while True:
-        try:
-            info = stream.resolve(video_id)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Stream %s failed: %s", video_id, exc)
-            message = str(exc)
-            if "Sign in to confirm" in message or "not a bot" in message:
-                detail = (
-                    "Could not resolve audio for this track right now. Please try again. "
-                    "If it keeps happening, connect YouTube Music in Settings."
-                )
-            else:
-                detail = (
-                    "Could not resolve audio for this track. The service may be busy. "
-                    "Please try again in a moment."
-                )
-            raise HTTPException(status_code=502, detail=detail) from exc
+    if not stream.VIDEO_ID_RE.match(video_id or ""):
+        raise HTTPException(status_code=400, detail="Invalid video id")
 
-        try:
-            upstream = requests.get(
-                info["url"],
-                headers=headers,
-                stream=True,
-                timeout=(15, None),
-                allow_redirects=True,
+    try:
+        entry = stream.resolve(video_id)
+    except stream.UnplayableError as exc:
+        status = 404 if exc.reason in ("removed", "private") else 403
+        raise HTTPException(status_code=status, detail=exc.detail) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Stream %s failed: %s", video_id, exc)
+        message = str(exc)
+        if "Sign in to confirm" in message or "not a bot" in message:
+            detail = "Could not resolve audio for this track right now. Please try again."
+        else:
+            detail = (
+                "Could not resolve audio for this track. The service may be busy. "
+                "Please try again in a moment."
             )
-        except Exception as exc:  # noqa: BLE001
-            raise HTTPException(status_code=502, detail=f"Audio upstream error: {exc}") from exc
+        raise HTTPException(status_code=502, detail=detail) from exc
 
-        # A cached googlevideo URL can expire. Drop it and resolve once more.
-        if upstream.status_code in (401, 403, 410) and attempts == 0:
-            upstream.close()
-            stream.invalidate(video_id)
-            attempts += 1
-            continue
-        break
+    total = entry.get("content_length")
+    if not total:
+        total = _probe_total(video_id, entry)
+        if total:
+            entry["content_length"] = total
 
-    if upstream.status_code == 416:
-        passthrough = _stream_headers(upstream, info["mime"])
-        upstream.close()
-        return Response(status_code=416, headers=passthrough)
+    try:
+        start, end, status_code = _parse_range(request.headers.get("range"), total)
+    except ValueError:
+        headers = {"Accept-Ranges": "bytes", "Cache-Control": "no-store"}
+        if total:
+            headers["Content-Range"] = f"bytes */{total}"
+        return Response(status_code=416, headers=headers)
 
-    if upstream.status_code >= 400:
-        upstream.close()
-        raise HTTPException(
-            status_code=502,
-            detail=f"Audio upstream returned HTTP {upstream.status_code}",
-        )
-
-    passthrough = _stream_headers(upstream, info["mime"])
+    length = (end - start + 1) if end is not None else None
+    headers = {
+        "Content-Type": entry["mime"],
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "no-store",
+    }
+    if status_code == 206:
+        headers["Content-Range"] = f"bytes {start}-{end}/{total if total else '*'}"
+    if length is not None:
+        headers["Content-Length"] = str(length)
 
     if request.method == "HEAD":
-        upstream.close()
-        return Response(status_code=upstream.status_code, headers=passthrough)
+        return Response(status_code=status_code, headers=headers)
 
-    return StreamingResponse(
-        _stream_chunks(upstream),
-        status_code=upstream.status_code,
-        headers=passthrough,
+    first_end = (
+        min(start + STREAM_CHUNK - 1, end)
+        if end is not None
+        else start + STREAM_CHUNK - 1
     )
+    try:
+        first, entry = _read_range(video_id, entry, start, first_end)
+    except stream.UnplayableError as exc:
+        status = 404 if exc.reason in ("removed", "private") else 403
+        raise HTTPException(status_code=status, detail=exc.detail) from exc
+    remaining_start = start + len(first)
+
+    def body():
+        if first:
+            yield first
+        if end is not None and remaining_start <= end:
+            yield from _iter_chunks(video_id, entry, remaining_start, end)
+
+    return StreamingResponse(body(), status_code=status_code, headers=headers)
 
 
 # --------------------------------------------------------------------------

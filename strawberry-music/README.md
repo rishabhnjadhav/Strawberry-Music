@@ -98,11 +98,25 @@ The session is stored in `auth.json` on the server and `/api/health` reports
 
 ### How playback works
 
-The server asks YouTube Music's player endpoint for the track, then solves the
-signature challenge with a local JavaScript runtime. If Node or Deno is missing,
-a pinned QuickJS binary is downloaded automatically and verified by SHA-256.
-When that path is unavailable, the server falls back to a public Invidious proxy
-and finally to yt-dlp. No account is required for any of these paths.
+The primary resolver is a small YouTube.js sidecar that runs next to the Python
+server. It asks YouTube's player endpoint for an audio-only stream, trying the
+`VISIONOS`, `YTMUSIC`, `WEB` and `MWEB` clients in order, preferring Opus itag
+`251` and falling back to AAC itag `140`. If a client is refused, it is skipped
+for ten minutes. BotGuard PO tokens are generated with `bgutils-js` only as a
+fallback for the web clients.
+
+The Python server proxies the audio itself, reading the upstream file in 1 MiB
+ranges with HTTP Range support (`206`, `Accept-Ranges`, `Content-Range`) so
+seeking works. If a range is rejected mid-track, the resolver gets a fresh URL
+for the same format and continues from the same byte. The browser never follows
+a redirect to the audio host.
+
+The sidecar is committed as a pre-bundled file, so no `npm install` is needed at
+runtime. The server uses an existing Node.js binary or downloads a pinned
+official Node.js build into `.bin/` and verifies it by SHA-256. If the sidecar is
+unavailable, the server falls back to the YouTube Music player endpoint with a
+local JavaScript solver, then a public Invidious proxy, and finally yt-dlp. No
+account is required for any of these paths.
 
 ## Environment variables
 
@@ -112,8 +126,13 @@ and finally to yt-dlp. No account is required for any of these paths.
 | `OMNI_COUNTRY` | `IN` | Catalog country/region code |
 | `OMNI_COOKIES` | – | Optional Netscape cookies file for yt-dlp |
 | `OMNI_PROXY` | – | HTTP/SOCKS proxy for the stream resolver |
-| `OMNI_STREAM_CLIENTS` | `android` / `tv,android` | Resolver clients; `tv,android` is used when signed in |
-| `OMNI_STREAM_ORDER` | auto | `invidious` prefers the public proxy; auto uses it first on Render |
+| `OMNI_STREAM_CLIENTS` | `android` / `tv,android` | yt-dlp fallback clients; `tv,android` is used when signed in |
+| `OMNI_STREAM_ORDER` | `youtubei` | `youtubei` uses the YouTube.js sidecar first; `invidious` prefers the public proxy |
+| `OMNI_YOUTUBEI` | `1` | Set to `0` to disable the YouTube.js sidecar |
+| `OMNI_YOUTUBEI_CLIENTS` | `VISIONOS,YTMUSIC,WEB,MWEB` | Client order for the sidecar |
+| `OMNI_PO_TOKEN` | `1` | Set to `0` to disable BotGuard PO-token fallback |
+| `OMNI_NODE_VERSION` | `22.11.0` | Node.js version downloaded when none is installed |
+| `OMNI_NODE_BIN` | — | Path to an existing Node.js binary |
 | `OMNI_INVIDIOUS` | built-in list | Comma-separated Invidious bases for anonymous playback |
 
 Example:
@@ -142,7 +161,8 @@ python -m uvicorn server.main:app --host 127.0.0.1 --port 8420
 | GET/HEAD | `/api/stream/{videoId}` | Audio proxy with HTTP Range support |
 
 Caches: home/search 5–10 min, artist/album/playlist 30 min, watch 15 min, lyrics
-24 h, resolved streams 3 h.
+24 h, YouTube.js stream URLs 5 min, fallback stream URLs 3 h, and unplayable
+verdicts 10 min.
 
 ## Troubleshooting
 

@@ -12,5 +12,14 @@ services:
         value: 3.12.4
       - key: PYTHONUNBUFFERED
         value: "1"
+      # YouTube.js is the primary audio resolver. The server finds an existing
+      # Node.js binary or downloads a pinned official build into .bin/.
       - key: OMNI_STREAM_ORDER
-        value: invidious
+        value: youtubei
+      - key: OMNI_YOUTUBEI
+        value: "1"
+      - key: OMNI_NODE_VERSION
+        value: 22.11.0
+      # BotGuard PO tokens are only used as a fallback for web clients.
+      - key: OMNI_PO_TOKEN
+        value: "1"

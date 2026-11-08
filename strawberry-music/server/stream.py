@@ -16,20 +16,33 @@ from urllib.parse import parse_qs, quote
 import requests
 import yt_dlp
 
-from . import ytm
+from . import node_runtime, ytm
 
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,20}$")
 STREAM_TTL = 3 * 60 * 60  # googlevideo URLs are valid for ~6h
+NODE_STREAM_TTL = 5 * 60  # the Node resolver hands back short-lived URLs
 FAILURE_TTL = 60
+UNPLAYABLE_TTL = 10 * 60
 LOCK_TTL = 10 * 60
 MAX_CACHE = 512
 MAX_PREFETCH_PENDING = 6
+UNPLAYABLE_REASONS = {"age-gate", "region", "private", "removed"}
 
 _cache: dict[str, dict] = {}
 _failures: dict[str, float] = {}
+_unplayable: dict[str, tuple[float, str, str]] = {}
 _locks: dict[str, threading.Lock] = {}
 _lock_seen: dict[str, float] = {}
 _guard = threading.Lock()
+
+
+class UnplayableError(RuntimeError):
+    """A track that YouTube says cannot be played (not a transient error)."""
+
+    def __init__(self, reason: str, detail: str):
+        super().__init__(detail)
+        self.reason = reason
+        self.detail = detail
 
 _prefetch_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="prefetch")
 _prefetch_pending: set[str] = set()
@@ -324,10 +337,78 @@ def _resolve_ytmusic(video_id: str) -> dict | None:
             "mime": mime,
             "title": details.get("title"),
             "duration": duration,
+            "source": "ytmusic",
             "expires": time.time() + 60 * 60,
         }
     except Exception:  # noqa: BLE001 - fall back to other resolvers
         return None
+
+
+def _resolve_node(
+    video_id: str, preferred_itag: int | None = None, strict_itag: bool = False
+) -> dict | None:
+    """Resolve through the bundled YouTube.js Node sidecar.
+
+    This is the primary path: VISIONOS first, then YTMUSIC/WEB/MWEB, with a
+    BotGuard PO-token fallback for the web clients. The sidecar returns a
+    googlevideo URL that the FastAPI proxy fetches in bounded ranges.
+    """
+    if (os.environ.get("OMNI_YOUTUBEI") or "1").strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        return None
+
+    try:
+        result = node_runtime.resolve(
+            video_id, itag=preferred_itag, strict=strict_itag
+        )
+    except node_runtime.SidecarUnavailable:
+        return None
+
+    if not result.get("ok"):
+        reason = str(result.get("reason") or "")
+        if reason in UNPLAYABLE_REASONS:
+            detail = str(result.get("detail") or "This track cannot be played.")
+            with _guard:
+                _unplayable[video_id] = (time.time(), reason, detail)
+            raise UnplayableError(reason, detail)
+        return None
+
+    url = result.get("url")
+    if not url:
+        return None
+
+    mime = str(result.get("mime") or "audio/webm").split(";")[0].strip()
+    if "mp4" in mime:
+        ext = "m4a"
+    elif "webm" in mime:
+        ext = "webm"
+    elif "mpeg" in mime:
+        ext = "mp3"
+    else:
+        ext = "opus"
+
+    content_length = result.get("contentLength")
+    try:
+        content_length = int(content_length) if content_length else None
+    except (TypeError, ValueError):
+        content_length = None
+
+    return {
+        "url": url,
+        "ext": ext,
+        "mime": mime,
+        "title": result.get("title"),
+        "duration": result.get("duration"),
+        "source": "youtubei",
+        "itag": result.get("itag"),
+        "client": result.get("client"),
+        "content_length": content_length,
+        "expires": time.time() + NODE_STREAM_TTL,
+    }
 
 
 DEFAULT_INVIDIOUS = [
@@ -346,12 +427,10 @@ def invidious_instances() -> list[str]:
 
 
 def _invidious_first() -> bool:
-    order = (os.environ.get("OMNI_STREAM_ORDER") or "").strip().lower()
-    if order:
-        return order == "invidious"
-    # Render's datacenter IP is usually challenged by YouTube for anonymous
-    # extraction, so use the proxy first there and keep yt-dlp as the fallback.
-    return bool(os.environ.get("RENDER"))
+    # The YouTube.js sidecar is the primary resolver. Set
+    # OMNI_STREAM_ORDER=invidious only to force the old proxy-first behaviour.
+    order = (os.environ.get("OMNI_STREAM_ORDER") or "youtubei").strip().lower()
+    return order == "invidious"
 
 
 def _resolve_invidious(video_id: str) -> dict | None:
@@ -410,6 +489,7 @@ def _resolve_invidious(video_id: str) -> dict | None:
                 "mime": mime,
                 "title": data.get("title"),
                 "duration": data.get("lengthSeconds"),
+                "source": "invidious",
                 "expires": time.time() + 60 * 60,
             }
         except Exception:  # noqa: BLE001 - try the next mirror
@@ -474,6 +554,9 @@ def _prune_locked(now: float) -> None:
     for video_id, failed_at in list(_failures.items()):
         if now - failed_at >= FAILURE_TTL:
             _failures.pop(video_id, None)
+    for video_id, verdict in list(_unplayable.items()):
+        if now - verdict[0] >= UNPLAYABLE_TTL:
+            _unplayable.pop(video_id, None)
     for video_id, lock in list(_locks.items()):
         seen = _lock_seen.get(video_id, 0)
         if not lock.locked() and now - seen > LOCK_TTL:
@@ -505,20 +588,57 @@ def invalidate(video_id: str) -> None:
     with _guard:
         _cache.pop(video_id, None)
         _failures.pop(video_id, None)
+    # The sidecar keeps its own short URL cache, so clear that too before a
+    # retry after a mid-track 403.
+    node_runtime.invalidate(video_id)
 
 
 def clear() -> None:
     with _guard:
         _cache.clear()
         _failures.clear()
+        _unplayable.clear()
         _locks.clear()
         _lock_seen.clear()
+
+
+def _store_entry(video_id: str, entry: dict) -> dict:
+    with _guard:
+        _cache[video_id] = entry
+        _failures.pop(video_id, None)
+        _unplayable.pop(video_id, None)
+        _lock_seen[video_id] = time.time()
+        _trim_cache_locked()
+    return entry
+
+
+def refresh(video_id: str, itag: int | None = None) -> dict:
+    """Get a fresh URL after an upstream range request is rejected.
+
+    When an itag is supplied, only that same audio format is accepted. Mixing
+    formats mid-track would make the byte offsets invalid, so a failed strict
+    refresh is reported instead.
+    """
+    if not VIDEO_ID_RE.match(video_id or ""):
+        raise ValueError("Invalid video id")
+
+    invalidate(video_id)
+    if not itag:
+        return resolve(video_id, force=True)
+
+    lock = _lock_for(video_id)
+    with lock:
+        entry = _resolve_node(video_id, preferred_itag=int(itag), strict_itag=True)
+        if not entry:
+            raise RuntimeError("Could not refresh the same audio format")
+        return _store_entry(video_id, entry)
 
 
 def resolve(video_id: str, force: bool = False) -> dict:
     """Return {url, ext, mime, title, duration} for a video id.
 
-    Raises RuntimeError when the resolver cannot produce a playable stream.
+    Raises UnplayableError for age-gated, private, removed or region-locked
+    tracks and RuntimeError for transient resolver failures.
     """
     if not VIDEO_ID_RE.match(video_id or ""):
         raise ValueError("Invalid video id")
@@ -526,6 +646,9 @@ def resolve(video_id: str, force: bool = False) -> dict:
     now = time.time()
     with _guard:
         _prune_locked(now)
+        verdict = _unplayable.get(video_id)
+        if verdict and now - verdict[0] < UNPLAYABLE_TTL:
+            raise UnplayableError(verdict[1], verdict[2])
         if not force:
             hit = _cache.get(video_id)
             if hit and hit["expires"] > now:
@@ -539,29 +662,29 @@ def resolve(video_id: str, force: bool = False) -> dict:
         now = time.time()
         with _guard:
             _prune_locked(now)
+            verdict = _unplayable.get(video_id)
+            if verdict and now - verdict[0] < UNPLAYABLE_TTL:
+                raise UnplayableError(verdict[1], verdict[2])
             if not force:
                 hit = _cache.get(video_id)
                 if hit and hit["expires"] > now:
                     return hit
 
         prefer_invidious = _invidious_first()
-        if prefer_invidious:
-            entry = _resolve_ytmusic(video_id)
+
+        # Primary path: YouTube.js sidecar (VISIONOS -> YTMUSIC -> WEB/MWEB).
+        if not prefer_invidious:
+            entry = _resolve_node(video_id)
             if entry:
-                with _guard:
-                    _cache[video_id] = entry
-                    _failures.pop(video_id, None)
-                    _lock_seen[video_id] = time.time()
-                    _trim_cache_locked()
-                return entry
-            fallback = _resolve_invidious(video_id)
-            if fallback:
-                with _guard:
-                    _cache[video_id] = fallback
-                    _failures.pop(video_id, None)
-                    _lock_seen[video_id] = time.time()
-                    _trim_cache_locked()
-                return fallback
+                return _store_entry(video_id, entry)
+
+        if prefer_invidious:
+            entry = _resolve_invidious(video_id)
+            if entry:
+                return _store_entry(video_id, entry)
+            entry = _resolve_node(video_id)
+            if entry:
+                return _store_entry(video_id, entry)
 
         last_error: Exception | None = None
         for client in clients():
@@ -582,14 +705,10 @@ def resolve(video_id: str, force: bool = False) -> dict:
                     "mime": MIME_TYPES.get(ext, "audio/mp4"),
                     "title": info.get("title"),
                     "duration": info.get("duration"),
+                    "source": "yt-dlp",
                     "expires": time.time() + STREAM_TTL,
                 }
-                with _guard:
-                    _cache[video_id] = entry
-                    _failures.pop(video_id, None)
-                    _lock_seen[video_id] = time.time()
-                    _trim_cache_locked()
-                return entry
+                return _store_entry(video_id, entry)
             except Exception as exc:  # noqa: BLE001 - try the next client
                 last_error = exc
                 continue
@@ -597,20 +716,10 @@ def resolve(video_id: str, force: bool = False) -> dict:
         if not prefer_invidious:
             entry = _resolve_ytmusic(video_id)
             if entry:
-                with _guard:
-                    _cache[video_id] = entry
-                    _failures.pop(video_id, None)
-                    _lock_seen[video_id] = time.time()
-                    _trim_cache_locked()
-                return entry
-            fallback = _resolve_invidious(video_id)
-            if fallback:
-                with _guard:
-                    _cache[video_id] = fallback
-                    _failures.pop(video_id, None)
-                    _lock_seen[video_id] = time.time()
-                    _trim_cache_locked()
-                return fallback
+                return _store_entry(video_id, entry)
+            entry = _resolve_invidious(video_id)
+            if entry:
+                return _store_entry(video_id, entry)
 
         with _guard:
             _failures[video_id] = time.time()
@@ -644,6 +753,7 @@ def prefetch(video_id: str) -> None:
 
 def shutdown() -> None:
     _prefetch_pool.shutdown(wait=False, cancel_futures=True)
+    node_runtime.shutdown()
 
 
 def cache_info() -> dict:
@@ -653,6 +763,8 @@ def cache_info() -> dict:
         return {
             "resolved": len(_cache),
             "failed": len(_failures),
+            "unplayable": len(_unplayable),
             "clients": clients(),
             "cookies": bool(os.environ.get("OMNI_COOKIES") or ytm.auth_path()),
+            "node": node_runtime.info(),
         }

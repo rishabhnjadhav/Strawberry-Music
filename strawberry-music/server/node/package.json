@@ -1,0 +1,18 @@
+{
+  "name": "strawberry-music-resolver",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "YouTube Music audio resolver sidecar for Strawberry Music",
+  "scripts": {
+    "build": "esbuild resolver.js --bundle --platform=node --format=cjs --target=node20 --outfile=resolver.bundle.cjs --minify",
+    "start": "node resolver.js"
+  },
+  "dependencies": {
+    "bgutils-js": "^4.0.3",
+    "youtubei.js": "^18.3.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}
