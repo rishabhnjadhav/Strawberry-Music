@@ -378,10 +378,19 @@ def _read_range(video_id: str, entry: dict, start: int, end: int) -> tuple[bytes
 
         remaining = end - start + 1
         buffer = bytearray()
+        # If the upstream ignored the Range header and returned 200, skip the
+        # prefix so the requested bytes still line up.
+        skip = start if upstream.status_code == 200 else 0
         try:
             for chunk in upstream.iter_content(chunk_size=64 * 1024):
                 if not chunk:
                     continue
+                if skip:
+                    if len(chunk) <= skip:
+                        skip -= len(chunk)
+                        continue
+                    chunk = chunk[skip:]
+                    skip = 0
                 buffer.extend(chunk)
                 if len(buffer) >= remaining:
                     del buffer[remaining:]
