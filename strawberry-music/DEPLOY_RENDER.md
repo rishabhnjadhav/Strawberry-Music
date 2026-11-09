@@ -116,6 +116,10 @@ Use this if Blueprint does not appear:
   `strawberry-music`, then redeploy. The app is not at the repository root.
   This is the most common cause when the service was created before the
   root-level `render.yaml` was added.
+- If you cannot set a Root Directory, use these commands from the repository
+  root instead:
+  - **Build Command:** `pip install -r strawberry-music/requirements.txt`
+  - **Start Command:** `cd strawberry-music && python -m server.main`
 - If Render says Python 3.12.4 is unavailable, change `PYTHON_VERSION` to `3.11.9` or `3.13.4` and redeploy.
 - If the service is slow on the first visit, that is normal on the free plan. Free services sleep after inactivity and take 30–60 seconds to wake up.
 - If the service status is **Suspended**, open the Render dashboard's **Billing** or **Usage** page. Free services can be suspended when the monthly instance-hour limit is reached or a payment method is required.
