@@ -118,6 +118,7 @@ Use this if Blueprint does not appear:
   root-level `render.yaml` was added.
 - If Render says Python 3.12.4 is unavailable, change `PYTHON_VERSION` to `3.11.9` or `3.13.4` and redeploy.
 - If the service is slow on the first visit, that is normal on the free plan. Free services sleep after inactivity and take 30–60 seconds to wake up.
+- If the service status is **Suspended**, open the Render dashboard's **Billing** or **Usage** page. Free services can be suspended when the monthly instance-hour limit is reached or a payment method is required.
 
 ---
 
