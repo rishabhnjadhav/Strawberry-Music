@@ -80,6 +80,12 @@ Before you commit, open GitHub Desktop and check the **Changes** list. You shoul
 7. Open the URL Render gives you, for example:
    `https://strawberry-music.onrender.com`
 
+> If a `strawberry-music` service already exists, do not create a second
+> Blueprint with the same name. Either update the existing service's
+> **Root Directory** to `strawberry-music` and use **Manual Deploy**, or
+> change the existing Blueprint's path to the root-level `render.yaml` and
+> sync it.
+
 ### Option B — Manual Web Service
 
 Use this if Blueprint does not appear:
