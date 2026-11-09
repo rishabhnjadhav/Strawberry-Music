@@ -1,0 +1,29 @@
+# Render Blueprint for the Strawberry Music repository.
+# The application lives in strawberry-music/, so the service root is set there.
+# Keep this file at the repository root so Render can detect it automatically.
+services:
+  - type: web
+    name: strawberry-music
+    runtime: python
+    plan: free
+    rootDir: strawberry-music
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m server.main
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.4
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      # YouTube.js is the primary audio resolver. The server finds an existing
+      # Node.js binary or downloads a pinned official build into .bin/.
+      - key: OMNI_STREAM_ORDER
+        value: youtubei
+      - key: OMNI_YOUTUBEI
+        value: "1"
+      - key: OMNI_NODE_VERSION
+        value: 22.11.0
+      # BotGuard PO tokens are only used as a fallback for web clients.
+      - key: OMNI_PO_TOKEN
+        value: "1"

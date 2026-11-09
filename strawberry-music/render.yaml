@@ -1,3 +1,6 @@
+# This copy is for a service whose Root Directory is already
+# strawberry-music/. For a Blueprint at the repository root, use the
+# root-level render.yaml (it sets rootDir: strawberry-music).
 services:
   - type: web
     name: strawberry-music

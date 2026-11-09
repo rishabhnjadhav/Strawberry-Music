@@ -7,6 +7,11 @@ The project already contains the Render configuration files:
 - `runtime.txt` — Python version
 - `.gitignore` — keeps private files out of GitHub
 
+> **Repository layout:** the app lives in the `strawberry-music/` folder.
+> The root-level `render.yaml` sets `rootDir: strawberry-music`, so Render
+> finds `requirements.txt` and `server/`. If you create the service manually,
+> set **Root Directory** to `strawberry-music` (see Option B).
+
 ---
 
 ## 1. What Render will run
@@ -70,7 +75,7 @@ Before you commit, open GitHub Desktop and check the **Changes** list. You shoul
 2. In the Render dashboard, click **New + → Blueprint**.
 3. Connect your GitHub account if asked.
 4. Select the `strawberry-music` repository.
-5. Render will detect `render.yaml`. Click **Apply** or **Create Resources**.
+5. Render will detect the root-level `render.yaml` (the one that sets `rootDir: strawberry-music`). If Render asks for a Blueprint path, choose `render.yaml` at the repository root, not the copy inside `strawberry-music/`. Click **Apply** or **Create Resources**.
 6. Wait for the deploy to finish. It can take a few minutes.
 7. Open the URL Render gives you, for example:
    `https://strawberry-music.onrender.com`
@@ -85,6 +90,7 @@ Use this if Blueprint does not appear:
    - **Name:** `strawberry-music`
    - **Region:** choose the one closest to you
    - **Branch:** `main`
+   - **Root Directory:** `strawberry-music`
    - **Runtime:** `Python 3`
    - **Build Command:** `pip install -r requirements.txt`
    - **Start Command:** `python -m server.main`
@@ -96,9 +102,14 @@ Use this if Blueprint does not appear:
 5. Click **Create Web Service**.
 6. Wait for the deploy to finish, then open the `onrender.com` URL.
 
-### If the build fails
+### If the build fails or the site returns 503
 
 - Check the Render **Logs** tab.
+- If the build cannot find `requirements.txt`, or the site returns 503, open
+  **Settings → Build & Deploy → Root Directory** and set it to
+  `strawberry-music`, then redeploy. The app is not at the repository root.
+  This is the most common cause when the service was created before the
+  root-level `render.yaml` was added.
 - If Render says Python 3.12.4 is unavailable, change `PYTHON_VERSION` to `3.11.9` or `3.13.4` and redeploy.
 - If the service is slow on the first visit, that is normal on the free plan. Free services sleep after inactivity and take 30–60 seconds to wake up.
 
@@ -210,6 +221,7 @@ After Render says the domain is verified:
 | Setting | Value |
 | --- | --- |
 | Render service type | Web Service |
+| Root directory | `strawberry-music` |
 | Runtime | Python 3 |
 | Build command | `pip install -r requirements.txt` |
 | Start command | `python -m server.main` |
