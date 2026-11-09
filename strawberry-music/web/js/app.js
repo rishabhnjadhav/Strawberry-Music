@@ -655,13 +655,25 @@ async function startRadio(track) {
   if (!track) return;
   try {
     toast("Tuning your radio…");
-    const data = await api.watch(track.videoId, 50);
+    let data;
+    try {
+      data = await api.radio(track.videoId);
+    } catch (error) {
+      console.warn("[radio] YouTube Music radio failed, using watch next", error);
+      data = await api.watch(track.videoId, 50);
+    }
     if (!data.tracks?.length) throw new Error("No radio tracks returned");
+    const seedTitle = data.seed?.title || track.title;
+    const tracks = data.tracks.map((item) => ({
+      ...item,
+      radio: { seedVideoId: track.videoId, seedTitle },
+      radioLabel: `${seedTitle} Radio`,
+    }));
     const index = Math.max(
       0,
-      data.tracks.findIndex((item) => item.videoId === track.videoId)
+      tracks.findIndex((item) => item.videoId === track.videoId)
     );
-    player.playTracks(data.tracks, index, {
+    player.playTracks(tracks, index, {
       type: "radio",
       id: track.videoId,
       title: `${track.title} Radio`,
@@ -957,13 +969,19 @@ function renderNPPanel() {
   panel.innerHTML = `${header}<div class="upnext-list">${rows}</div>`;
 }
 
+function queueSubLine(track) {
+  const artist = track.artistText || "";
+  if (!track.radioLabel) return artist;
+  return artist ? `${artist} · ${track.radioLabel}` : track.radioLabel;
+}
+
 function upNextRow(track, index, active) {
   return `<div class="upnext-row ${active ? "is-current" : ""}" data-action="play-queue"
                data-index="${index}" role="button" tabindex="0">
     ${view.artHTML(track)}
     <div class="meta">
       <div class="title">${view.esc(track.title)}</div>
-      <div class="sub">${view.esc(track.artistText || "")}</div>
+      <div class="sub">${view.esc(queueSubLine(track))}</div>
     </div>
     <span class="dur">${view.esc(track.duration || view.fmtTime(track.durationSeconds))}</span>
     <button class="icon-btn" data-action="remove-queue" data-index="${index}" aria-label="Remove from queue">
@@ -1102,7 +1120,7 @@ function queueRow(track, index, active) {
     <div class="qrow-art">${view.artHTML(track)}</div>
     <div class="qrow-meta">
       <div class="qrow-title">${view.esc(track.title)}</div>
-      <div class="qrow-sub">${view.esc(track.artistText || "")}</div>
+      <div class="qrow-sub">${view.esc(queueSubLine(track))}</div>
     </div>
     <span class="qrow-dur">${view.esc(track.duration || view.fmtTime(track.durationSeconds))}</span>
     <button class="icon-btn" data-action="remove-queue" data-index="${index}" aria-label="Remove from queue">
@@ -1905,11 +1923,13 @@ async function handleAction(element) {
     case "seek-lyric":
       player.seek(Number(element.dataset.time));
       break;
-    case "toggle-autoplay":
-      player.state.autoplay = !player.state.autoplay;
+    case "toggle-autoplay": {
+      const nextAutoplay = !player.state.autoplay;
+      player.setAutoplay(nextAutoplay);
       renderNPPanel();
-      toast(player.state.autoplay ? "Autoplay on" : "Autoplay off");
+      toast(nextAutoplay ? "Autoplay on" : "Autoplay off");
       break;
+    }
 
     case "scroll-shelf": {
       const target = $(element.dataset.target);

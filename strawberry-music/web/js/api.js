@@ -47,6 +47,7 @@ export const api = {
     request(`/api/playlist/${encodeURIComponent(id)}?limit=${limit}`),
   watch: (videoId, limit = 50) =>
     request(`/api/watch/${encodeURIComponent(videoId)}?limit=${limit}`),
+  radio: (videoId) => request(`/api/radio/${encodeURIComponent(videoId)}`),
 
   lyrics: ({ videoId, title, artistText, album, durationSeconds }) => {
     const params = new URLSearchParams({

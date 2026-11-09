@@ -303,6 +303,41 @@ def resolve(
         raise SidecarUnavailable("Audio resolver returned invalid JSON") from exc
 
 
+def radio(
+    video_id: str, cookie: str | None = None, timeout: float = 45.0
+) -> dict[str, Any]:
+    """Ask the sidecar for the YouTube Music radio mix for a video id."""
+    if not available() and not start_sidecar(wait=30):
+        raise SidecarUnavailable(_last_error or "The radio resolver is not ready.")
+
+    with _guard:
+        port = _port
+    if not port:
+        raise SidecarUnavailable("The radio resolver has no listening port.")
+
+    payload: dict[str, Any] = {"videoId": video_id}
+    if cookie:
+        payload["cookie"] = cookie
+
+    try:
+        response = requests.post(
+            f"http://127.0.0.1:{port}/radio",
+            json=payload,
+            timeout=(5, timeout),
+        )
+    except requests.RequestException as exc:
+        raise SidecarUnavailable(f"Radio resolver request failed: {exc}") from exc
+
+    if response.status_code not in (200, 502):
+        raise SidecarUnavailable(
+            f"Radio resolver returned HTTP {response.status_code}"
+        )
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise SidecarUnavailable("Radio resolver returned invalid JSON") from exc
+
+
 def invalidate(video_id: str) -> None:
     if not available():
         return

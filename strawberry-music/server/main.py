@@ -200,6 +200,61 @@ def api_watch(video_id: str, limit: int = Query(50, ge=1, le=100)):
         raise fail(exc, "Up next") from exc
 
 
+@app.get("/api/radio/{video_id}")
+def api_radio(video_id: str, request: Request):
+    _radio_rate_limit(request)
+
+    if not stream.VIDEO_ID_RE.match(video_id or ""):
+        raise HTTPException(status_code=400, detail="Invalid video id")
+
+    cookie = ytm.auth_cookie() if ytm.is_authenticated() else None
+    result: dict | None = None
+    try:
+        result = node_runtime.radio(video_id, cookie=cookie)
+    except Exception as exc:  # noqa: BLE001 - radio must never break playback
+        log.warning(
+            "Radio %s sidecar failed: %s: %s", video_id, type(exc).__name__, exc
+        )
+
+    if result and result.get("ok"):
+        return result
+    if result:
+        log.warning(
+            "Radio %s sidecar returned %s: %s",
+            video_id,
+            result.get("reason"),
+            str(result.get("detail") or "")[:240],
+        )
+
+    # Fall back to the catalog watch-next panel if the Node sidecar is down or
+    # YouTube Music refuses the request. The frontend gets the same track shape.
+    try:
+        data = ytm.watch(video_id, 50)
+        tracks = [track for track in (data.get("tracks") or []) if track]
+        seed = next(
+            (track for track in tracks if track.get("videoId") == video_id),
+            tracks[0] if tracks else None,
+        )
+        return {
+            "ok": True,
+            "seed": {
+                "videoId": video_id,
+                "title": (seed or {}).get("title") or "",
+                "isVideo": bool(seed and not seed.get("album")),
+            },
+            "tracks": tracks,
+            "personal": bool(cookie),
+            "fallback": "ytmusicapi",
+        }
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "Radio %s fallback failed: %s: %s", video_id, type(exc).__name__, exc
+        )
+        raise HTTPException(
+            status_code=502, detail="Radio is unavailable right now."
+        ) from exc
+
+
 @app.get("/api/lyrics")
 def api_lyrics(
     videoId: str,
@@ -258,6 +313,36 @@ def _rate_limit(request: Request) -> None:
             for key, values in list(_rate_hits.items()):
                 if not values or now - values[-1] > RATE_WINDOW:
                     _rate_hits.pop(key, None)
+
+
+RADIO_RATE_LIMIT = 30
+RADIO_RATE_WINDOW = 60.0
+_radio_rate_lock = threading.Lock()
+_radio_rate_hits: dict[str, list[float]] = {}
+
+
+def _radio_rate_limit(request: Request) -> None:
+    client = request.client.host if request.client else "unknown"
+    now = time.time()
+    with _radio_rate_lock:
+        hits = [
+            stamp
+            for stamp in _radio_rate_hits.get(client, [])
+            if now - stamp < RADIO_RATE_WINDOW
+        ]
+        if len(hits) >= RADIO_RATE_LIMIT:
+            _radio_rate_hits[client] = hits
+            raise HTTPException(
+                status_code=429,
+                detail="Too many radio requests. Please wait a moment.",
+                headers={"Retry-After": "30"},
+            )
+        hits.append(now)
+        _radio_rate_hits[client] = hits
+        if len(_radio_rate_hits) > 2048:
+            for key, values in list(_radio_rate_hits.items()):
+                if not values or now - values[-1] > RADIO_RATE_WINDOW:
+                    _radio_rate_hits.pop(key, None)
 
 
 def _parse_range(

@@ -27,7 +27,7 @@ const state = {
   loading: false,
   shuffle: false,
   repeat: "off",
-  autoplay: true,
+  autoplay: store.data.autoplay !== false,
   muted: false,
   volume: audio.volume,
   currentTime: 0,
@@ -37,11 +37,19 @@ const state = {
   lyricsLoading: false,
   fullscreen: false,
   tab: "upnext",
-  extending: false,
+  radioLoading: false,
+  radioToken: 0,
+  radioRequestToken: -1,
+  lastRadioAttempt: 0,
+  pendingAutoAdvance: false,
+  radioExhausted: new Set(),
+  sessionPlayedIds: new Set(),
+  sessionPlayedTitles: new Set(),
 };
 
 const shuffleHistory = [];
 const lyricCache = new Map();
+let radioRequestSeq = 0;
 
 function emit(event, payload) {
   listeners[event]?.forEach((fn) => {
@@ -59,6 +67,76 @@ function clamp(value, min, max) {
 
 function current() {
   return state.queue[state.index] || null;
+}
+
+function normalizeKeyPart(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function artistTextOf(track) {
+  if (track?.artistText) return track.artistText;
+  return (track?.artists || [])
+    .map((artist) => artist?.name)
+    .filter(Boolean)
+    .join(", ");
+}
+
+function trackTitleKey(track) {
+  const title = normalizeKeyPart(track?.title);
+  const artist = normalizeKeyPart(artistTextOf(track));
+  if (!title && !artist) return "";
+  return `${title}|${artist}`;
+}
+
+function rememberPlayed(track) {
+  if (!track?.videoId) return;
+  state.sessionPlayedIds.add(track.videoId);
+  const key = trackTitleKey(track);
+  if (key) state.sessionPlayedTitles.add(key);
+}
+
+function isKnownTrack(track, queueIds, queueKeys) {
+  if (!track?.videoId) return true;
+  if (queueIds.has(track.videoId) || state.sessionPlayedIds.has(track.videoId)) {
+    return true;
+  }
+  const key = trackTitleKey(track);
+  return Boolean(key && (queueKeys.has(key) || state.sessionPlayedTitles.has(key)));
+}
+
+function remainingAfterCurrent() {
+  return Math.max(0, state.queue.length - state.index - 1);
+}
+
+function manualInsertIndex() {
+  const start = Math.max(0, state.index + 1);
+  for (let cursor = start; cursor < state.queue.length; cursor += 1) {
+    if (state.queue[cursor]?.radio) return cursor;
+  }
+  return state.queue.length;
+}
+
+function withRadioLabel(track, seed) {
+  const seedTitle = String(seed?.title || "Unknown").trim() || "Unknown";
+  return {
+    ...track,
+    radio: { seedVideoId: seed?.videoId || "", seedTitle },
+    radioLabel: `${seedTitle} Radio`,
+  };
+}
+
+function radioCandidates() {
+  const candidates = [];
+  for (let cursor = state.index; cursor >= 0 && candidates.length < 3; cursor -= 1) {
+    const track = state.queue[cursor];
+    if (track?.videoId && !state.radioExhausted.has(track.videoId)) {
+      candidates.push(track);
+    }
+  }
+  return candidates;
 }
 
 function setPlaying(value) {
@@ -100,6 +178,8 @@ function playTracks(tracks, startIndex = 0, context = null) {
   state.context = context || null;
   state.lyrics = null;
   shuffleHistory.length = 0;
+  state.radioExhausted.clear();
+  state.pendingAutoAdvance = false;
   emit("queue");
   load(true);
   return true;
@@ -118,6 +198,10 @@ function playIndex(index, autoplay = true) {
 function load(autoplay) {
   const track = current();
   if (!track) return;
+
+  state.radioToken += 1;
+  state.pendingAutoAdvance = false;
+  rememberPlayed(track);
 
   state.loading = true;
   setPlaying(Boolean(autoplay));
@@ -139,6 +223,7 @@ function load(autoplay) {
 
   loadLyrics(track);
   prefetchAround();
+  maybeTopUpRadio();
 
   if (autoplay) {
     const promise = audio.play();
@@ -208,9 +293,15 @@ function next(manual = true) {
       return;
     }
     if (state.autoplay) {
+      state.pendingAutoAdvance = true;
       extend().then((added) => {
-        if (added > 0) next(false);
-        else stopAtEnd();
+        if (added > 0) {
+          state.pendingAutoAdvance = false;
+          next(false);
+        } else if (!state.radioLoading) {
+          state.pendingAutoAdvance = false;
+          stopAtEnd();
+        }
       });
       return;
     }
@@ -304,6 +395,13 @@ function cycleRepeat() {
   emit("state");
 }
 
+function setAutoplay(value) {
+  state.autoplay = Boolean(value);
+  store.setAutoplay(state.autoplay);
+  emit("state");
+  if (state.autoplay) maybeTopUpRadio();
+}
+
 /* -------------------------------------------------------------------------- */
 /* Queue editing                                                              */
 /* -------------------------------------------------------------------------- */
@@ -324,7 +422,7 @@ function addToQueue(track) {
     playTracks([track], 0, { type: "single", title: track.title, thumb: track.thumb });
     return;
   }
-  state.queue.push(track);
+  state.queue.splice(manualInsertIndex(), 0, track);
   emit("queue");
 }
 
@@ -361,32 +459,97 @@ function clearQueue() {
   state.lyrics = null;
   state.lyricsLoading = false;
   shuffleHistory.length = 0;
+  state.radioToken += 1;
+  radioRequestSeq += 1;
+  state.radioLoading = false;
+  state.radioRequestToken = -1;
+  state.pendingAutoAdvance = false;
+  state.lastRadioAttempt = 0;
+  state.radioExhausted.clear();
+  state.sessionPlayedIds.clear();
+  state.sessionPlayedTitles.clear();
   emit("state");
   emit("queue");
   emit("lyrics");
 }
 
-async function extend() {
-  if (state.extending) return 0;
-  const base = state.queue[state.queue.length - 1] || current();
-  if (!base) return 0;
+function maybeTopUpRadio() {
+  if (!state.autoplay || state.repeat !== "off" || !current()) return;
+  if (remainingAfterCurrent() >= 5) return;
+  if (state.radioLoading && state.radioRequestToken === state.radioToken) return;
+  topUpRadio({ force: false, autoAdvance: true }).catch((error) => {
+    console.warn("[player] autoplay top-up failed", error);
+  });
+}
 
-  state.extending = true;
+async function topUpRadio({ force = false, autoAdvance = true } = {}) {
+  if (!state.autoplay || state.repeat !== "off" || !current()) return 0;
+  if (!force && remainingAfterCurrent() >= 5) return 0;
+  if (state.radioLoading && state.radioRequestToken === state.radioToken) return 0;
+
+  const token = state.radioToken;
+  const playing = current();
+  const requestId = ++radioRequestSeq;
+  state.radioLoading = true;
+  state.radioRequestToken = token;
+  state.lastRadioAttempt = Date.now();
+
   try {
-    const data = await api.watch(base.videoId, 50);
-    const existing = new Set(state.queue.map((track) => track.videoId));
-    const extra = (data.tracks || []).filter((track) => !existing.has(track.videoId)).slice(0, 30);
-    if (extra.length) {
-      state.queue.push(...extra);
-      emit("queue");
+    const seeds = radioCandidates();
+    for (const seed of seeds) {
+      let data;
+      try {
+        data = await api.radio(seed.videoId);
+      } catch (error) {
+        console.warn("[player] radio request failed", error);
+        return 0;
+      }
+
+      if (token !== state.radioToken || current()?.videoId !== playing.videoId) {
+        return 0;
+      }
+      if (!state.autoplay || state.repeat !== "off") return 0;
+      if (data?.ok === false) {
+        console.warn("[player] radio returned no data", data.reason || "unknown");
+        return 0;
+      }
+
+      const queueIds = new Set(state.queue.map((track) => track.videoId));
+      const queueKeys = new Set(
+        state.queue.map((track) => trackTitleKey(track)).filter(Boolean)
+      );
+      const extra = (data?.tracks || [])
+        .filter((track) => track?.videoId && !isKnownTrack(track, queueIds, queueKeys))
+        .slice(0, 30);
+
+      if (extra.length) {
+        state.queue.push(...extra.map((track) => withRadioLabel(track, seed)));
+        emit("queue");
+        if (autoAdvance && state.pendingAutoAdvance) {
+          state.pendingAutoAdvance = false;
+          setTimeout(() => {
+            if (current() && state.index + 1 < state.queue.length) {
+              playIndex(state.index + 1);
+            }
+          }, 0);
+        }
+        return extra.length;
+      }
+
+      state.radioExhausted.add(seed.videoId);
     }
-    return extra.length;
-  } catch (error) {
-    console.warn("[player] autoplay extension failed", error);
     return 0;
   } finally {
-    state.extending = false;
+    if (requestId === radioRequestSeq) {
+      state.radioLoading = false;
+      state.radioRequestToken = -1;
+      emit("state");
+    }
   }
+}
+
+function extend() {
+  return topUpRadio({ force: true, autoAdvance: false });
 }
 
 /* -------------------------------------------------------------------------- */
@@ -566,6 +729,20 @@ audio.addEventListener("error", () => {
 });
 
 /* -------------------------------------------------------------------------- */
+/* Autoplay watchdog                                                          */
+/* -------------------------------------------------------------------------- */
+
+setInterval(() => {
+  if (!state.autoplay || state.repeat !== "off" || state.radioLoading) return;
+  if (!current() || remainingAfterCurrent() > 0) return;
+  if (Date.now() - state.lastRadioAttempt < 15000) return;
+  if (audio.ended) state.pendingAutoAdvance = true;
+  topUpRadio({ force: true, autoAdvance: true }).catch((error) => {
+    console.warn("[player] autoplay watchdog failed", error);
+  });
+}, 5000);
+
+/* -------------------------------------------------------------------------- */
 /* Public API                                                                 */
 /* -------------------------------------------------------------------------- */
 
@@ -590,6 +767,7 @@ export const player = {
   toggleShuffle,
   setShuffle,
   cycleRepeat,
+  setAutoplay,
   setFullscreen,
   setTab,
   playNext,

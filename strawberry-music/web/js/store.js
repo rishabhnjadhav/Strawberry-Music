@@ -15,6 +15,7 @@ function defaults() {
     playCounts: {},
     savedAlbums: [],
     volume: 0.85,
+    autoplay: true,
     createdAt: Date.now(),
   };
 }
@@ -259,6 +260,11 @@ export const store = {
   /* -------------------------------------------------------------- settings */
   setVolume(volume) {
     data.volume = Math.max(0, Math.min(1, Number(volume) || 0));
+    scheduleSave();
+  },
+
+  setAutoplay(value) {
+    data.autoplay = Boolean(value);
     scheduleSave();
   },
 

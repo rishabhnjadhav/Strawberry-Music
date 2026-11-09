@@ -12,6 +12,7 @@
  * handed back to Python, which proxies the bytes so the browser never sees or
  * follows a googlevideo redirect.
  */
+import { createHash } from 'node:crypto';
 import http from 'node:http';
 import { Innertube, Platform } from 'youtubei.js';
 import { getPoToken } from './po-token.js';
@@ -30,8 +31,10 @@ const MAX_CLIENT_ATTEMPTS = 3;
 const CLIENT_COOLDOWN_MS = 10 * 60 * 1000;
 const URL_TTL_MS = 5 * 60 * 1000;
 const SESSION_TTL_MS = 30 * 60 * 1000;
+const RADIO_TTL_MS = 5 * 60 * 1000;
+const RADIO_SESSION_TTL_MS = 30 * 60 * 1000;
 const VIDEO_ID_RE = /^[A-Za-z0-9_-]{6,20}$/;
-const MAX_BODY_BYTES = 16 * 1024;
+const MAX_BODY_BYTES = 64 * 1024;
 
 let session = null;
 let sessionCreatedAt = 0;
@@ -39,6 +42,8 @@ let sessionPromise = null;
 
 const cooldowns = new Map();
 const cache = new Map();
+const radioCache = new Map();
+const radioSessions = new Map();
 
 function now() {
   return Date.now();
@@ -75,6 +80,222 @@ async function getSession() {
     return await sessionPromise;
   } finally {
     sessionPromise = null;
+  }
+}
+
+function cookieHash(cookie) {
+  return createHash('sha256').update(cookie).digest('hex');
+}
+
+function pruneRadioState() {
+  for (const [key, entry] of radioCache) {
+    if (entry.expiresAt <= now()) radioCache.delete(key);
+  }
+  for (const [key, entry] of radioSessions) {
+    if (now() - entry.createdAt >= RADIO_SESSION_TTL_MS) radioSessions.delete(key);
+  }
+}
+
+async function getRadioSession(cookie) {
+  if (!cookie) return getSession();
+  pruneRadioState();
+  const key = cookieHash(cookie);
+  const hit = radioSessions.get(key);
+  if (hit && now() - hit.createdAt < RADIO_SESSION_TTL_MS) return hit.yt;
+  const yt = await Innertube.create({ cookie, retrieve_player: true });
+  radioSessions.set(key, { yt, createdAt: now() });
+  return yt;
+}
+
+function textOf(value) {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string') return value.trim();
+  try {
+    return String(value.toString()).trim();
+  } catch {
+    return '';
+  }
+}
+
+function hasAlbum(cut) {
+  return Boolean(cut?.album && textOf(cut.album.name));
+}
+
+function artistsOf(cut) {
+  const artists = Array.isArray(cut?.artists) ? cut.artists : [];
+  return artists
+    .map((artist) => ({
+      name: textOf(artist?.name),
+      id: artist?.channel_id || artist?.endpoint?.payload?.browseId || null,
+    }))
+    .filter((artist) => artist.name);
+}
+
+function artistTextOf(cut, artists) {
+  if (artists.length) return artists.map((artist) => artist.name).join(', ');
+  return textOf(cut?.author);
+}
+
+function largestThumb(cut) {
+  const thumbs = Array.isArray(cut?.thumbnail) ? cut.thumbnail : [];
+  if (!thumbs.length) return '';
+  const best = thumbs.reduce((winner, item) => {
+    const area = Number(item?.width || 0) * Number(item?.height || 0);
+    const winnerArea = Number(winner?.width || 0) * Number(winner?.height || 0);
+    return area > winnerArea ? item : winner;
+  }, thumbs[0]);
+  let url = textOf(best?.url);
+  if (!url) return '';
+  if (/googleusercontent\.com|ggpht\.com/.test(url)) {
+    if (/=w\d+-h\d+/.test(url)) {
+      url = url.replace(/=w\d+-h\d+[^=]*$/, '=w544-h544-l90-rj');
+    } else if (/=s\d+/.test(url)) {
+      url = url.replace(/=s\d+[^=]*$/, '=s544');
+    }
+  }
+  return url;
+}
+
+function explicitOf(cut) {
+  const badges = Array.isArray(cut?.badges) ? cut.badges : [];
+  return badges.some((badge) => {
+    const icon = String(badge?.icon_type || '').toUpperCase();
+    const label = textOf(badge?.label).toLowerCase();
+    return icon.includes('EXPLICIT') || label.includes('explicit');
+  });
+}
+
+function durationOf(cut) {
+  const seconds = Math.max(0, Math.floor(Number(cut?.duration?.seconds) || 0));
+  const text = textOf(cut?.duration?.text);
+  if (text) return { duration: text, durationSeconds: seconds };
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return {
+    duration: seconds ? `${minutes}:${String(rest).padStart(2, '0')}` : '',
+    durationSeconds: seconds,
+  };
+}
+
+function mapCut(cut) {
+  if (!cut || !cut.video_id) return null;
+  const artists = artistsOf(cut);
+  const album =
+    cut.album && textOf(cut.album.name)
+      ? {
+          name: textOf(cut.album.name),
+          id: cut.album.id || null,
+          year: cut.album.year || null,
+        }
+      : null;
+  const timing = durationOf(cut);
+  return {
+    kind: 'track',
+    videoId: String(cut.video_id),
+    title: textOf(cut.title),
+    artists,
+    artistText: artistTextOf(cut, artists),
+    album,
+    duration: timing.duration,
+    durationSeconds: timing.durationSeconds,
+    thumb: largestThumb(cut),
+    explicit: explicitOf(cut),
+    year: album?.year || null,
+  };
+}
+
+function cutsOf(row) {
+  if (!row) return [];
+  if (row.primary || row.counterpart) {
+    const cuts = [row.primary, ...(Array.isArray(row.counterpart) ? row.counterpart : [])];
+    return cuts.filter((cut) => cut && cut.video_id);
+  }
+  return row.video_id ? [row] : [];
+}
+
+function mapRadioPanel(panel, seedVideoId) {
+  const rows = Array.isArray(panel?.contents) ? panel.contents : [];
+  const allCuts = rows.flatMap(cutsOf);
+  const seedCut =
+    allCuts.find((cut) => cut.video_id === seedVideoId) ||
+    allCuts.find((cut) => cut.selected) ||
+    allCuts[0] ||
+    null;
+  const seedIsVideo = Boolean(seedCut && !hasAlbum(seedCut));
+  const tracks = [];
+
+  for (const row of rows) {
+    const cuts = cutsOf(row);
+    if (!cuts.length) continue;
+    let chosen = cuts[0];
+    if (row.primary || row.counterpart) {
+      chosen = seedIsVideo
+        ? cuts.find((cut) => !hasAlbum(cut)) || cuts[0]
+        : cuts.find((cut) => hasAlbum(cut)) || cuts[0];
+    }
+    const mapped = mapCut(chosen);
+    if (mapped) tracks.push(mapped);
+  }
+
+  return {
+    seed: {
+      videoId: seedVideoId,
+      title: seedCut ? textOf(seedCut.title) : '',
+      isVideo: seedIsVideo,
+    },
+    tracks,
+  };
+}
+
+async function fetchRadio(yt, videoId) {
+  const panel = await yt.music.getUpNext(videoId, true);
+  return mapRadioPanel(panel, videoId);
+}
+
+async function radio(videoId, cookie) {
+  const personal = Boolean(cookie);
+  const cacheKey = personal ? `p:${cookieHash(cookie)}:${videoId}` : `a:${videoId}`;
+  pruneRadioState();
+  const hit = radioCache.get(cacheKey);
+  if (hit && hit.expiresAt > now()) {
+    return { ok: true, ...hit.payload, cached: true };
+  }
+
+  try {
+    const yt = await getRadioSession(cookie);
+    const payload = await fetchRadio(yt, videoId);
+    const result = { ...payload, personal };
+    radioCache.set(cacheKey, { expiresAt: now() + RADIO_TTL_MS, payload: result });
+    return { ok: true, ...result, cached: false };
+  } catch (error) {
+    if (personal) {
+      console.warn(
+        `[resolver] personal radio failed; retrying anonymously: ${String(
+          error?.message || error,
+        ).slice(0, 200)}`,
+      );
+      try {
+        const yt = await getSession();
+        const payload = await fetchRadio(yt, videoId);
+        const result = { ...payload, personal: false, authFallback: true };
+        radioCache.set(`a:${videoId}`, {
+          expiresAt: now() + RADIO_TTL_MS,
+          payload: result,
+        });
+        return { ok: true, ...result, cached: false };
+      } catch (anonError) {
+        return {
+          ok: false,
+          reason: 'radio-error',
+          detail: String(anonError?.message || anonError).slice(0, 240),
+        };
+      }
+    }
+    return {
+      ok: false,
+      reason: 'radio-error',
+      detail: String(error?.message || error).slice(0, 240),
+    };
   }
 }
 
@@ -257,6 +478,8 @@ function health() {
     session: Boolean(session),
     sessionAgeSeconds: session ? Math.floor((now() - sessionCreatedAt) / 1000) : null,
     cached: cache.size,
+    radioCached: radioCache.size,
+    radioSessions: radioSessions.size,
     cooldowns: Object.fromEntries(
       [...cooldowns.entries()].map(([client, entry]) => [
         client,
@@ -314,6 +537,28 @@ const server = http.createServer(async (request, response) => {
       const preferredItag = Number(payload.itag) === 140 ? 140 : 251;
       const strictItag = Boolean(payload.strictItag);
       const result = await resolve(videoId, preferredItag, strictItag);
+      sendJson(response, result.ok ? 200 : 502, result);
+    } catch (error) {
+      sendJson(response, 400, {
+        ok: false,
+        reason: 'invalid',
+        detail: String(error?.message || error).slice(0, 240),
+      });
+    }
+    return;
+  }
+
+  if (request.method === 'POST' && url.pathname === '/radio') {
+    try {
+      const body = await readBody(request);
+      const payload = JSON.parse(body || '{}');
+      const videoId = String(payload.videoId || '');
+      if (!VIDEO_ID_RE.test(videoId)) {
+        sendJson(response, 400, { ok: false, reason: 'invalid', detail: 'Invalid video id.' });
+        return;
+      }
+      const cookie = String(payload.cookie || '').trim();
+      const result = await radio(videoId, cookie || null);
       sendJson(response, result.ok ? 200 : 502, result);
     } catch (error) {
       sendJson(response, 400, {

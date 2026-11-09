@@ -87,6 +87,27 @@ def is_authenticated() -> bool:
     return bool(auth_path())
 
 
+def auth_cookie() -> str | None:
+    """Return the browser cookie header for an optional personal radio session.
+
+    The value is read server-side and passed only to the local Node sidecar. It
+    must never be logged or returned to the browser.
+    """
+    path = auth_path()
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8-sig") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    cookie = str(data.get("cookie") or "").strip()
+    cookie = re.sub(r"^\s*cookie\s*:\s*", "", cookie, flags=re.I)
+    return cookie or None
+
+
 def reset_clients() -> None:
     global _client_generation
     with _auth_lock:
