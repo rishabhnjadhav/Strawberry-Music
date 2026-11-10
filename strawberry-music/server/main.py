@@ -257,6 +257,7 @@ def _radio_search_fallback(
             part = _radio_key(part)
             if part:
                 allowed_artists.add(part)
+    seed_title_key = _radio_key(title)
     tracks: list[dict] = []
 
     def add(items, require_known_artist: bool = False) -> None:
@@ -267,6 +268,9 @@ def _radio_search_fallback(
                 continue
             item_id = item["videoId"]
             if item_id in seen_ids:
+                continue
+            item_title = _radio_key(item.get("title"))
+            if seed_title_key and item_title == seed_title_key:
                 continue
             item_artist = _radio_key(item.get("artistText"))
             if require_known_artist and allowed_artists:
@@ -340,6 +344,10 @@ def _radio_search_fallback(
     return tracks, title
 
 
+_radio_sidecar_lock = threading.Lock()
+_radio_sidecar_block_until = 0.0
+
+
 @app.get("/api/radio/{video_id}")
 def api_radio(
     video_id: str,
@@ -353,22 +361,36 @@ def api_radio(
     if not stream.VIDEO_ID_RE.match(video_id or ""):
         raise HTTPException(status_code=400, detail="Invalid video id")
 
+    global _radio_sidecar_block_until
+
     cookie = ytm.auth_cookie() if ytm.is_authenticated() else None
     result: dict | None = None
-    try:
-        result = node_runtime.radio(video_id, cookie=cookie)
-    except Exception as exc:  # noqa: BLE001 - radio must never break playback
-        log.warning("Radio %s sidecar failed: %s", video_id, _radio_error(exc))
+    with _radio_sidecar_lock:
+        sidecar_blocked = time.time() < _radio_sidecar_block_until
+    if sidecar_blocked:
+        log.info("Radio %s skipping sidecar after recent failure", video_id)
+    else:
+        try:
+            result = node_runtime.radio(video_id, cookie=cookie, timeout=6.0)
+        except Exception as exc:  # noqa: BLE001 - radio must never break playback
+            log.warning("Radio %s sidecar failed: %s", video_id, _radio_error(exc))
+            with _radio_sidecar_lock:
+                _radio_sidecar_block_until = time.time() + 120.0
 
-    if result and result.get("ok") and result.get("tracks"):
-        return result
-    if result:
-        log.warning(
-            "Radio %s sidecar returned %s: %s",
-            video_id,
-            result.get("reason"),
-            str(result.get("detail") or "")[:240],
-        )
+        if result and result.get("ok") and result.get("tracks"):
+            with _radio_sidecar_lock:
+                _radio_sidecar_block_until = 0.0
+            return result
+        if result:
+            log.warning(
+                "Radio %s sidecar returned %s: %s",
+                video_id,
+                result.get("reason") or ("empty" if result.get("ok") else "error"),
+                str(result.get("detail") or "")[:240],
+            )
+            if not result.get("ok"):
+                with _radio_sidecar_lock:
+                    _radio_sidecar_block_until = time.time() + 120.0
 
     # Fall back to the catalog watch-next panel if the Node sidecar is down or
     # YouTube Music refuses the request. The frontend gets the same track shape.
