@@ -12,6 +12,7 @@ import os
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
 import requests
@@ -204,6 +205,10 @@ def _radio_key(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip().lower())
 
 
+def _radio_error(exc: Exception) -> str:
+    return f"{type(exc).__name__}: {str(exc)[:240]}"
+
+
 def _radio_seed_metadata(video_id: str, title: str, artist: str) -> tuple[str, str]:
     title = (title or "").strip()
     artist = (artist or "").strip()
@@ -224,7 +229,7 @@ def _radio_seed_metadata(video_id: str, title: str, artist: str) -> tuple[str, s
         title = title or str(data.get("title") or "").strip()
         artist = artist or str(data.get("author_name") or "").strip()
     except Exception as exc:  # noqa: BLE001 - metadata is only for the fallback
-        log.info("Radio seed metadata %s failed: %s", video_id, exc)
+        log.info("Radio seed metadata %s failed: %s", video_id, _radio_error(exc))
     return title, artist
 
 
@@ -243,7 +248,15 @@ def _radio_search_fallback(
     seen_keys: set[str] = set()
     if title or artist:
         seen_keys.add(f"{_radio_key(title)}|{_radio_key(artist)}")
-    allowed_artists = {_radio_key(artist)} if artist else set()
+    allowed_artists: set[str] = set()
+    if artist:
+        allowed_artists.add(_radio_key(artist))
+        for part in re.split(
+            r"\s*(?:,|&|/|\bfeat\.?\b|\bft\.?\b)\s*", artist, flags=re.I
+        ):
+            part = _radio_key(part)
+            if part:
+                allowed_artists.add(part)
     tracks: list[dict] = []
 
     def add(items, require_known_artist: bool = False) -> None:
@@ -266,26 +279,6 @@ def _radio_search_fallback(
             seen_keys.add(key)
             tracks.append(item)
 
-    if artist_id and len(tracks) < 50:
-        try:
-            info = ytm.artist(artist_id)
-            add(info.get("songs"))
-            for related in (info.get("related") or [])[:4]:
-                if len(tracks) >= 50:
-                    break
-                browse_id = related.get("browseId")
-                if not browse_id:
-                    continue
-                related_name = _radio_key(related.get("name"))
-                if related_name:
-                    allowed_artists.add(related_name)
-                try:
-                    add(ytm.artist(browse_id).get("songs"))
-                except Exception as exc:  # noqa: BLE001
-                    log.info("Radio related artist %s failed: %s", browse_id, exc)
-        except Exception as exc:  # noqa: BLE001
-            log.info("Radio artist %s failed: %s", artist_id, exc)
-
     queries = []
     if title and artist:
         queries.append(f"{title} {artist}")
@@ -294,16 +287,55 @@ def _radio_search_fallback(
     if title:
         queries.append(title)
 
-    for query in queries:
-        if len(tracks) >= 50:
-            break
+    if queries:
+        with ThreadPoolExecutor(max_workers=len(queries)) as pool:
+            futures = [
+                pool.submit(ytm.search, query, "songs", 25) for query in queries
+            ]
+            for query, future in zip(queries, futures):
+                if len(tracks) >= 50:
+                    break
+                try:
+                    add(
+                        future.result().get("items"),
+                        require_known_artist=bool(allowed_artists),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.info("Radio search %r failed: %s", query, _radio_error(exc))
+
+    if artist_id and len(tracks) < 12:
+        related_ids: list[str] = []
         try:
-            add(
-                ytm.search(query, "songs", 25).get("items"),
-                require_known_artist=bool(allowed_artists),
-            )
+            info = ytm.artist(artist_id)
+            add(info.get("songs"))
+            for related in (info.get("related") or [])[:3]:
+                browse_id = related.get("browseId")
+                if not browse_id:
+                    continue
+                related_ids.append(browse_id)
+                related_name = _radio_key(related.get("name"))
+                if related_name:
+                    allowed_artists.add(related_name)
         except Exception as exc:  # noqa: BLE001
-            log.info("Radio search %r failed: %s", query, exc)
+            log.info("Radio artist %s failed: %s", artist_id, _radio_error(exc))
+
+        if related_ids and len(tracks) < 50:
+            with ThreadPoolExecutor(max_workers=len(related_ids)) as pool:
+                futures = {
+                    browse_id: pool.submit(ytm.artist, browse_id)
+                    for browse_id in related_ids
+                }
+                for browse_id, future in futures.items():
+                    if len(tracks) >= 50:
+                        break
+                    try:
+                        add(future.result().get("songs"))
+                    except Exception as exc:  # noqa: BLE001
+                        log.info(
+                            "Radio related artist %s failed: %s",
+                            browse_id,
+                            _radio_error(exc),
+                        )
 
     return tracks, title
 
@@ -326,9 +358,7 @@ def api_radio(
     try:
         result = node_runtime.radio(video_id, cookie=cookie)
     except Exception as exc:  # noqa: BLE001 - radio must never break playback
-        log.warning(
-            "Radio %s sidecar failed: %s: %s", video_id, type(exc).__name__, exc
-        )
+        log.warning("Radio %s sidecar failed: %s", video_id, _radio_error(exc))
 
     if result and result.get("ok") and result.get("tracks"):
         return result
@@ -363,10 +393,7 @@ def api_radio(
             }
     except Exception as exc:  # noqa: BLE001
         log.warning(
-            "Radio %s watch fallback failed: %s: %s",
-            video_id,
-            type(exc).__name__,
-            exc,
+            "Radio %s watch fallback failed: %s", video_id, _radio_error(exc)
         )
 
     try:
@@ -387,10 +414,7 @@ def api_radio(
             }
     except Exception as exc:  # noqa: BLE001
         log.warning(
-            "Radio %s search fallback failed: %s: %s",
-            video_id,
-            type(exc).__name__,
-            exc,
+            "Radio %s search fallback failed: %s", video_id, _radio_error(exc)
         )
 
     raise HTTPException(status_code=502, detail="Radio is unavailable right now.")

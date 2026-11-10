@@ -51,11 +51,9 @@ export const api = {
     const params = new URLSearchParams();
     if (seed?.title) params.set("title", seed.title);
     const artist =
+      (seed?.artists || []).find((item) => item?.name)?.name ||
       seed?.artistText ||
-      (seed?.artists || [])
-        .map((item) => item?.name)
-        .filter(Boolean)
-        .join(", ");
+      "";
     if (artist) params.set("artist", artist);
     const artistId = (seed?.artists || []).find((item) => item?.id)?.id;
     if (artistId) params.set("artistId", artistId);
