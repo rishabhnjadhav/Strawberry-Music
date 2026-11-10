@@ -346,6 +346,8 @@ def _radio_search_fallback(
 
 _radio_sidecar_lock = threading.Lock()
 _radio_sidecar_block_until = 0.0
+_radio_watch_lock = threading.Lock()
+_radio_watch_block_until = 0.0
 
 
 @app.get("/api/radio/{video_id}")
@@ -361,7 +363,7 @@ def api_radio(
     if not stream.VIDEO_ID_RE.match(video_id or ""):
         raise HTTPException(status_code=400, detail="Invalid video id")
 
-    global _radio_sidecar_block_until
+    global _radio_sidecar_block_until, _radio_watch_block_until
 
     cookie = ytm.auth_cookie() if ytm.is_authenticated() else None
     result: dict | None = None
@@ -394,29 +396,38 @@ def api_radio(
 
     # Fall back to the catalog watch-next panel if the Node sidecar is down or
     # YouTube Music refuses the request. The frontend gets the same track shape.
-    try:
-        data = ytm.watch(video_id, 50)
-        tracks = [track for track in (data.get("tracks") or []) if track]
-        if tracks:
-            seed = next(
-                (track for track in tracks if track.get("videoId") == video_id),
-                tracks[0],
+    with _radio_watch_lock:
+        watch_blocked = time.time() < _radio_watch_block_until
+    if watch_blocked:
+        log.info("Radio %s skipping watch fallback after recent failure", video_id)
+    else:
+        try:
+            data = ytm.watch(video_id, 50)
+            tracks = [track for track in (data.get("tracks") or []) if track]
+            if tracks:
+                with _radio_watch_lock:
+                    _radio_watch_block_until = 0.0
+                seed = next(
+                    (track for track in tracks if track.get("videoId") == video_id),
+                    tracks[0],
+                )
+                return {
+                    "ok": True,
+                    "seed": {
+                        "videoId": video_id,
+                        "title": (seed or {}).get("title") or "",
+                        "isVideo": bool(seed and not seed.get("album")),
+                    },
+                    "tracks": tracks,
+                    "personal": bool(cookie),
+                    "fallback": "ytmusicapi",
+                }
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "Radio %s watch fallback failed: %s", video_id, _radio_error(exc)
             )
-            return {
-                "ok": True,
-                "seed": {
-                    "videoId": video_id,
-                    "title": (seed or {}).get("title") or "",
-                    "isVideo": bool(seed and not seed.get("album")),
-                },
-                "tracks": tracks,
-                "personal": bool(cookie),
-                "fallback": "ytmusicapi",
-            }
-    except Exception as exc:  # noqa: BLE001
-        log.warning(
-            "Radio %s watch fallback failed: %s", video_id, _radio_error(exc)
-        )
+            with _radio_watch_lock:
+                _radio_watch_block_until = time.time() + 120.0
 
     try:
         tracks, seed_title = _radio_search_fallback(
