@@ -47,7 +47,23 @@ export const api = {
     request(`/api/playlist/${encodeURIComponent(id)}?limit=${limit}`),
   watch: (videoId, limit = 50) =>
     request(`/api/watch/${encodeURIComponent(videoId)}?limit=${limit}`),
-  radio: (videoId) => request(`/api/radio/${encodeURIComponent(videoId)}`),
+  radio: (videoId, seed = null) => {
+    const params = new URLSearchParams();
+    if (seed?.title) params.set("title", seed.title);
+    const artist =
+      seed?.artistText ||
+      (seed?.artists || [])
+        .map((item) => item?.name)
+        .filter(Boolean)
+        .join(", ");
+    if (artist) params.set("artist", artist);
+    const artistId = (seed?.artists || []).find((item) => item?.id)?.id;
+    if (artistId) params.set("artistId", artistId);
+    const query = params.toString();
+    return request(
+      `/api/radio/${encodeURIComponent(videoId)}${query ? `?${query}` : ""}`
+    );
+  },
 
   lyrics: ({ videoId, title, artistText, album, durationSeconds }) => {
     const params = new URLSearchParams({

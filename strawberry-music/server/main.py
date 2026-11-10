@@ -200,8 +200,122 @@ def api_watch(video_id: str, limit: int = Query(50, ge=1, le=100)):
         raise fail(exc, "Up next") from exc
 
 
+def _radio_key(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def _radio_seed_metadata(video_id: str, title: str, artist: str) -> tuple[str, str]:
+    title = (title or "").strip()
+    artist = (artist or "").strip()
+    if title and artist:
+        return title, artist
+    try:
+        response = requests.get(
+            "https://www.youtube.com/oembed",
+            params={
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+                "format": "json",
+            },
+            headers={"User-Agent": ytm.USER_AGENT},
+            timeout=8,
+        )
+        response.raise_for_status()
+        data = response.json()
+        title = title or str(data.get("title") or "").strip()
+        artist = artist or str(data.get("author_name") or "").strip()
+    except Exception as exc:  # noqa: BLE001 - metadata is only for the fallback
+        log.info("Radio seed metadata %s failed: %s", video_id, exc)
+    return title, artist
+
+
+def _radio_search_fallback(
+    video_id: str, title: str, artist: str, artist_id: str
+) -> tuple[list[dict], str]:
+    """Build a radio-like mix from YouTube Music search and related artists.
+
+    The ``next`` endpoint used by YouTube Music radio is sometimes blocked for
+    cloud-hosted IPs. Search and artist pages use different endpoints and keep
+    working, so this fallback keeps autoplay useful instead of silently
+    stopping after the current song.
+    """
+    title, artist = _radio_seed_metadata(video_id, title, artist)
+    seen_ids = {video_id}
+    seen_keys: set[str] = set()
+    if title or artist:
+        seen_keys.add(f"{_radio_key(title)}|{_radio_key(artist)}")
+    allowed_artists = {_radio_key(artist)} if artist else set()
+    tracks: list[dict] = []
+
+    def add(items, require_known_artist: bool = False) -> None:
+        for item in items or []:
+            if len(tracks) >= 50:
+                return
+            if not isinstance(item, dict) or not item.get("videoId"):
+                continue
+            item_id = item["videoId"]
+            if item_id in seen_ids:
+                continue
+            item_artist = _radio_key(item.get("artistText"))
+            if require_known_artist and allowed_artists:
+                if not any(name in item_artist for name in allowed_artists):
+                    continue
+            key = f"{_radio_key(item.get('title'))}|{item_artist}"
+            if key in seen_keys:
+                continue
+            seen_ids.add(item_id)
+            seen_keys.add(key)
+            tracks.append(item)
+
+    if artist_id and len(tracks) < 50:
+        try:
+            info = ytm.artist(artist_id)
+            add(info.get("songs"))
+            for related in (info.get("related") or [])[:4]:
+                if len(tracks) >= 50:
+                    break
+                browse_id = related.get("browseId")
+                if not browse_id:
+                    continue
+                related_name = _radio_key(related.get("name"))
+                if related_name:
+                    allowed_artists.add(related_name)
+                try:
+                    add(ytm.artist(browse_id).get("songs"))
+                except Exception as exc:  # noqa: BLE001
+                    log.info("Radio related artist %s failed: %s", browse_id, exc)
+        except Exception as exc:  # noqa: BLE001
+            log.info("Radio artist %s failed: %s", artist_id, exc)
+
+    queries = []
+    if title and artist:
+        queries.append(f"{title} {artist}")
+    if artist:
+        queries.append(artist)
+    if title:
+        queries.append(title)
+
+    for query in queries:
+        if len(tracks) >= 50:
+            break
+        try:
+            add(
+                ytm.search(query, "songs", 25).get("items"),
+                require_known_artist=bool(allowed_artists),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.info("Radio search %r failed: %s", query, exc)
+
+    return tracks, title
+
+
 @app.get("/api/radio/{video_id}")
-def api_radio(video_id: str, request: Request):
+def api_radio(
+    video_id: str,
+    request: Request,
+    title: str = Query("", max_length=300),
+    artist: str = Query("", max_length=300),
+    artistId: str = Query("", max_length=100),
+):
     _radio_rate_limit(request)
 
     if not stream.VIDEO_ID_RE.match(video_id or ""):
@@ -216,7 +330,7 @@ def api_radio(video_id: str, request: Request):
             "Radio %s sidecar failed: %s: %s", video_id, type(exc).__name__, exc
         )
 
-    if result and result.get("ok"):
+    if result and result.get("ok") and result.get("tracks"):
         return result
     if result:
         log.warning(
@@ -231,28 +345,55 @@ def api_radio(video_id: str, request: Request):
     try:
         data = ytm.watch(video_id, 50)
         tracks = [track for track in (data.get("tracks") or []) if track]
-        seed = next(
-            (track for track in tracks if track.get("videoId") == video_id),
-            tracks[0] if tracks else None,
-        )
-        return {
-            "ok": True,
-            "seed": {
-                "videoId": video_id,
-                "title": (seed or {}).get("title") or "",
-                "isVideo": bool(seed and not seed.get("album")),
-            },
-            "tracks": tracks,
-            "personal": bool(cookie),
-            "fallback": "ytmusicapi",
-        }
+        if tracks:
+            seed = next(
+                (track for track in tracks if track.get("videoId") == video_id),
+                tracks[0],
+            )
+            return {
+                "ok": True,
+                "seed": {
+                    "videoId": video_id,
+                    "title": (seed or {}).get("title") or "",
+                    "isVideo": bool(seed and not seed.get("album")),
+                },
+                "tracks": tracks,
+                "personal": bool(cookie),
+                "fallback": "ytmusicapi",
+            }
     except Exception as exc:  # noqa: BLE001
         log.warning(
-            "Radio %s fallback failed: %s: %s", video_id, type(exc).__name__, exc
+            "Radio %s watch fallback failed: %s: %s",
+            video_id,
+            type(exc).__name__,
+            exc,
         )
-        raise HTTPException(
-            status_code=502, detail="Radio is unavailable right now."
-        ) from exc
+
+    try:
+        tracks, seed_title = _radio_search_fallback(
+            video_id, title, artist, artistId
+        )
+        if tracks:
+            return {
+                "ok": True,
+                "seed": {
+                    "videoId": video_id,
+                    "title": seed_title,
+                    "isVideo": False,
+                },
+                "tracks": tracks,
+                "personal": bool(cookie),
+                "fallback": "search",
+            }
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "Radio %s search fallback failed: %s: %s",
+            video_id,
+            type(exc).__name__,
+            exc,
+        )
+
+    raise HTTPException(status_code=502, detail="Radio is unavailable right now.")
 
 
 @app.get("/api/lyrics")

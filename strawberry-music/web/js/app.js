@@ -657,7 +657,7 @@ async function startRadio(track) {
     toast("Tuning your radio…");
     let data;
     try {
-      data = await api.radio(track.videoId);
+      data = await api.radio(track.videoId, track);
     } catch (error) {
       console.warn("[radio] YouTube Music radio failed, using watch next", error);
       data = await api.watch(track.videoId, 50);

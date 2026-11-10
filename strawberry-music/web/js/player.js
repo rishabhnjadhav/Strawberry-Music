@@ -499,7 +499,7 @@ async function topUpRadio({ force = false, autoAdvance = true } = {}) {
     for (const seed of seeds) {
       let data;
       try {
-        data = await api.radio(seed.videoId);
+        data = await api.radio(seed.videoId, seed);
       } catch (error) {
         console.warn("[player] radio request failed", error);
         return 0;
